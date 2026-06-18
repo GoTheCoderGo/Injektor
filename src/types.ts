@@ -35,8 +35,10 @@ export enum BindingType {
   Instance = "Instance",
   /** Binding to a constant value. */
   Constant = "Constant",
-  /** Binding to a factory function. */
+  /** Binding to a synchronous factory function. */
   Factory = "Factory",
+  /** Binding to an asynchronous factory function. */
+  AsyncFactory = "AsyncFactory",
 }
 
 /**
@@ -55,18 +57,69 @@ export interface Binding<T = unknown> {
   value?: T;
   /** The factory function (for Factory bindings). */
   factory?: () => T;
+  /** The async factory function (for AsyncFactory bindings). */
+  asyncFactory?: () => Promise<T>;
   /** Cached singleton instance. */
   cache?: T;
+  /** Named constraint for this binding. */
+  name?: string;
+  /** Tagged constraints for this binding. */
+  tags?: Record<string, unknown>;
 }
 
 /**
- * Shape of constructor injection metadata stored on a class.
- * An ordered array of service identifiers matching the constructor parameters.
+ * Describes constraints for a constructor injection argument.
  */
-export type ConstructorInjectMetadata = ReadonlyArray<ServiceIdentifier>;
+export interface InjectDescriptor<T = unknown> {
+  /** The service identifier token. */
+  token: ServiceIdentifier<T>;
+  /** Named constraint for disambiguation. */
+  named?: string;
+  /** Tagged constraints for conditional resolution. */
+  tags?: Record<string, unknown>;
+  /** If true, resolve all bindings as an array. */
+  multi?: boolean;
+}
+
+/**
+ * A constructor injection argument: either a plain token or a rich descriptor.
+ */
+export type InjectArg<T = unknown> = ServiceIdentifier<T> | InjectDescriptor<T>;
+
+/**
+ * Shape of constructor injection metadata stored on a class.
+ * An ordered array of injection arguments matching the constructor parameters.
+ */
+export type ConstructorInjectMetadata = ReadonlyArray<InjectArg>;
 
 /**
  * Shape of property injection metadata stored on a class.
  * Maps field name → service identifier token.
  */
 export type PropertyInjectMetadata = Map<string | symbol, ServiceIdentifier>;
+
+/**
+ * Shape of named property injection metadata.
+ * Maps field name → constraint name.
+ */
+export type NamedInjectMetadata = Map<string | symbol, string>;
+
+/**
+ * Shape of tagged property injection metadata.
+ * Maps field name → tags record.
+ */
+export type TaggedInjectMetadata = Map<string | symbol, Record<string, unknown>>;
+
+/**
+ * Shape of multi-inject property metadata.
+ * Maps field name → service identifier token.
+ */
+export type MultiInjectMetadata = Map<string | symbol, ServiceIdentifier>;
+
+/**
+ * Options for the Container constructor.
+ */
+export interface ContainerOptions {
+  /** Parent container for hierarchical resolution. */
+  parent?: import("./container.ts").Container;
+}

@@ -5,11 +5,11 @@ import {
   inject,
   injectConstructor,
   createToken,
-  Scope,
   ServiceNotFoundError,
   CircularDependencyError,
   NotInjectableError,
   InvalidDecoratorUsageError,
+  AmbiguousBindingError,
 } from "../index.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,6 +179,8 @@ describe("Container", () => {
 
     it("request scope should share instances within one get() call", () => {
       const SHARED = createToken<IWeapon>("SharedWeapon");
+      const A_ID = createToken<any>("A_ID");
+      const B_ID = createToken<any>("B_ID");
 
       @injectable()
       @injectConstructor(SHARED)
@@ -192,19 +194,6 @@ describe("Container", () => {
         constructor(public weapon: IWeapon) {}
       }
 
-      @injectable()
-      @injectConstructor(
-        createToken<HolderA>("A_ID"),
-        createToken<HolderB>("B_ID"),
-      )
-      class Root {
-        constructor(public a: HolderA, public b: HolderB) {}
-      }
-
-      const A_ID = createToken<HolderA>("A_ID");
-      const B_ID = createToken<HolderB>("B_ID");
-
-      // Re-define Root with the actual tokens
       @injectable()
       @injectConstructor(A_ID, B_ID)
       class RootActual {

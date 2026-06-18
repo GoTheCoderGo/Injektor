@@ -53,3 +53,16 @@ export class NotInjectableError extends Error {
     this.name = "NotInjectableError";
   }
 }
+
+/**
+ * Thrown when multiple bindings exist for a token and no constraint narrows it to one.
+ */
+export class AmbiguousBindingError extends Error {
+  constructor(id: ServiceIdentifier, count: number) {
+    super(
+      `Ambiguous: ${count} bindings found for ${formatId(id)}. ` +
+      `Use getNamed(), getTagged(), or getAll() to disambiguate.`
+    );
+    this.name = "AmbiguousBindingError";
+  }
+}
