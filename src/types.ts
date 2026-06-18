@@ -1,0 +1,1 @@
+export type RegistryType=Map<string | symbol , string | symbol>
