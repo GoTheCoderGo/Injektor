@@ -1,5 +1,6 @@
 import type { Constructor, ServiceIdentifier, Binding } from "./types.ts";
 import { Scope, BindingType } from "./types.ts";
+import { SCOPE_KEY } from "./consts.ts";
 
 /**
  * Fluent API builder for configuring a binding.
@@ -39,6 +40,12 @@ export class BindingBuilder<T> {
   to(impl: Constructor<T>): this {
     this._binding.type = BindingType.Instance;
     this._binding.implementationClass = impl;
+
+    const metadata = (impl as any)[Symbol.metadata];
+    if (metadata && metadata[SCOPE_KEY]) {
+      this._binding.scope = metadata[SCOPE_KEY] as Scope;
+    }
+
     this._commitOnce();
     return this;
   }

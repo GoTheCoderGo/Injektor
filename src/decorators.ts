@@ -5,6 +5,7 @@ import {
   NAMED_INJECT_KEY,
   TAGGED_INJECT_KEY,
   MULTI_INJECT_KEY,
+  SCOPE_KEY,
 } from "./consts.ts";
 import { InvalidDecoratorUsageError } from "./errors.ts";
 import type {
@@ -14,11 +15,20 @@ import type {
   NamedInjectMetadata,
   TaggedInjectMetadata,
   MultiInjectMetadata,
+  Scope,
 } from "./types.ts";
 
 // Polyfill Symbol.metadata for runtimes that don't yet expose it natively.
 // @ts-ignore — Symbol.metadata is a stage 3 well-known symbol
 Symbol.metadata ??= Symbol.for("Symbol.metadata");
+
+/**
+ * Options for the @injectable decorator.
+ */
+export interface InjectableOptions {
+  /** Default scope for the injected service. */
+  scope?: Scope;
+}
 
 /**
  * Marks a class as available for dependency injection.
@@ -28,9 +38,12 @@ Symbol.metadata ??= Symbol.for("Symbol.metadata");
  * ```ts
  * @injectable()
  * class MyService { }
+ * 
+ * @injectable({ scope: Scope.Singleton })
+ * class SingletonService { }
  * ```
  */
-export function injectable() {
+export function injectable(options?: InjectableOptions) {
   return (_: any, context: DecoratorContext) => {
     if (context.kind !== "class") {
       throw new InvalidDecoratorUsageError(
@@ -39,6 +52,9 @@ export function injectable() {
       );
     }
     context.metadata[INJECTABLE_KEY] = true;
+    if (options?.scope) {
+      context.metadata[SCOPE_KEY] = options.scope;
+    }
     // Initialize metadata maps if they haven't been set by other decorators yet.
     context.metadata[CONSTRUCTOR_INJECT_KEY] ??= [];
     context.metadata[PROPERTY_INJECT_KEY] ??= new Map();

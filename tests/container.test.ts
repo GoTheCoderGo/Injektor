@@ -10,6 +10,7 @@ import {
   NotInjectableError,
   InvalidDecoratorUsageError,
   AmbiguousBindingError,
+  Scope,
 } from "../index.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +172,21 @@ describe("Container", () => {
     it("singleton scope should return the same instance", () => {
       const c = new Container();
       c.bind(WEAPON).to(Katana).inSingletonScope();
+
+      const w1 = c.get(WEAPON);
+      const w2 = c.get(WEAPON);
+      expect(w1).toBe(w2);
+    });
+
+    it("should use the scope defined in the @injectable options", () => {
+      @injectable({ scope: Scope.Singleton })
+      class SingletonWeapon implements IWeapon {
+        name = "SingletonWeapon";
+      }
+
+      const c = new Container();
+      // No explicit scope chained, should use the decorator's scope
+      c.bind(WEAPON).to(SingletonWeapon);
 
       const w1 = c.get(WEAPON);
       const w2 = c.get(WEAPON);
