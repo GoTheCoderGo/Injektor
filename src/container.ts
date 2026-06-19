@@ -92,8 +92,12 @@ export class Container {
   /** Optional parent container for hierarchical resolution. */
   private _parent?: Container;
 
+  /** Whether to automatically bind unregistered @injectable() classes. */
+  private _autoBindInjectable: boolean;
+
   constructor(options?: ContainerOptions) {
     this._parent = options?.parent;
+    this._autoBindInjectable = options?.autoBindInjectable ?? false;
   }
 
   // ──────────────────────── Binding registration ────────────────────────
@@ -254,13 +258,31 @@ export class Container {
   }
 
   /**
+   * Attempt to automatically bind a requested class if autobinding is enabled.
+   */
+  private _tryAutoBind(id: ServiceIdentifier): void {
+    if (this._autoBindInjectable && typeof id === "function") {
+      const metadata = (id as any)[Symbol.metadata];
+      if (metadata && metadata[INJECTABLE_KEY] === true) {
+        this.bind(id as Constructor).toSelf();
+      }
+    }
+  }
+
+  /**
    * Select a single binding matching optional constraints.
    */
   private _selectBinding<T>(
     id: ServiceIdentifier<T>,
     constraints: { named?: string; tags?: Record<string, unknown> },
   ): Binding<T> {
-    const all = this._lookupAll(id) as Binding<T>[];
+    let all = this._lookupAll(id) as Binding<T>[];
+    
+    if (all.length === 0) {
+      this._tryAutoBind(id);
+      all = this._lookupAll(id) as Binding<T>[];
+    }
+
     if (all.length === 0) {
       throw new ServiceNotFoundError(id);
     }
@@ -363,7 +385,13 @@ export class Container {
     resolutionStack: ServiceIdentifier[],
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T[] {
-    const all = this._lookupAll(id) as Binding<T>[];
+    let all = this._lookupAll(id) as Binding<T>[];
+    
+    if (all.length === 0) {
+      this._tryAutoBind(id);
+      all = this._lookupAll(id) as Binding<T>[];
+    }
+
     if (all.length === 0) {
       throw new ServiceNotFoundError(id);
     }

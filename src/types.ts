@@ -122,4 +122,6 @@ export type MultiInjectMetadata = Map<string | symbol, ServiceIdentifier>;
 export interface ContainerOptions {
   /** Parent container for hierarchical resolution. */
   parent?: import("./container.ts").Container;
+  /** If true, the container will automatically bind and resolve unregistered @injectable() classes. */
+  autoBindInjectable?: boolean;
 }

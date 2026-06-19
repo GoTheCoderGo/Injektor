@@ -259,6 +259,52 @@ describe("Container", () => {
     });
   });
 
+  // ── Autobinding ──
+
+  describe("autobinding", () => {
+    it("should implicitly bind @injectable classes if autoBindInjectable is true", () => {
+      @injectable()
+      class AutoSword implements IWeapon {
+        name = "AutoSword";
+      }
+
+      const c = new Container({ autoBindInjectable: true });
+      expect(c.isBound(AutoSword)).toBe(false);
+
+      const sword = c.get(AutoSword);
+      expect(sword).toBeInstanceOf(AutoSword);
+      expect(sword.name).toBe("AutoSword");
+      expect(c.isBound(AutoSword)).toBe(true); // Should be bound permanently
+    });
+
+    it("should respect explicit scope when autobinding", () => {
+      @injectable({ scope: Scope.Singleton })
+      class AutoSingleton {
+        value = Math.random();
+      }
+
+      const c = new Container({ autoBindInjectable: true });
+      const s1 = c.get(AutoSingleton);
+      const s2 = c.get(AutoSingleton);
+      expect(s1).toBe(s2);
+    });
+
+    it("should not autobind if autoBindInjectable is false", () => {
+      @injectable()
+      class AutoFail {}
+
+      const c = new Container();
+      expect(() => c.get(AutoFail)).toThrow(ServiceNotFoundError);
+    });
+
+    it("should throw ServiceNotFoundError if requested class lacks @injectable() even with autobinding", () => {
+      class PlainSword {}
+
+      const c = new Container({ autoBindInjectable: true });
+      expect(() => c.get(PlainSword)).toThrow(ServiceNotFoundError);
+    });
+  });
+
   // ── Error handling ──
 
   describe("error handling", () => {
