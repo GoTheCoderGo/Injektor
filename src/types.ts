@@ -116,6 +116,8 @@ export type TaggedInjectMetadata = Map<string | symbol, Record<string, unknown>>
  */
 export type MultiInjectMetadata = Map<string | symbol, ServiceIdentifier>;
 
+import type { ResolutionStrategy } from "./resolution-stack.ts";
+
 /**
  * Options for the Container constructor.
  */
@@ -124,4 +126,13 @@ export interface ContainerOptions {
   parent?: import("./container.ts").Container;
   /** If true, the container will automatically bind and resolve unregistered @injectable() classes. */
   autoBindInjectable?: boolean;
+  /**
+   * Strategy for the resolution stack used in circular-dependency detection.
+   *
+   * - `"set"` — O(1) `has()` lookups via `Set` (default).
+   * - `"array"` — O(n) `has()` lookups via `Array.includes()`.
+   *
+   * @default "set"
+   */
+  resolutionStrategy?: ResolutionStrategy;
 }

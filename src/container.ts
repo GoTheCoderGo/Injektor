@@ -14,6 +14,8 @@ import {
 } from "./errors.ts";
 import { BindingBuilder } from "./binding.ts";
 import { ContainerModule } from "./module.ts";
+import { createResolutionStack } from "./resolution-stack.ts";
+import type { ResolutionStack, ResolutionStrategy } from "./resolution-stack.ts";
 import type {
   Constructor,
   ServiceIdentifier,
@@ -95,9 +97,18 @@ export class Container {
   /** Whether to automatically bind unregistered @injectable() classes. */
   private _autoBindInjectable: boolean;
 
+  /** Strategy for the resolution stack ("set" or "array"). */
+  private _resolutionStrategy: ResolutionStrategy;
+
   constructor(options?: ContainerOptions) {
     this._parent = options?.parent;
     this._autoBindInjectable = options?.autoBindInjectable ?? false;
+    this._resolutionStrategy = options?.resolutionStrategy ?? "array";
+  }
+
+  /** Create an empty `ResolutionStack` using the configured strategy. */
+  private _createStack(): ResolutionStack {
+    return createResolutionStack(this._resolutionStrategy);
   }
 
   // ──────────────────────── Binding registration ────────────────────────
@@ -183,7 +194,7 @@ export class Container {
    */
   get<T>(id: ServiceIdentifier<T>): T {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolve<T>(id, {}, new Set(), requestCache);
+    return this._resolve<T>(id, {}, this._createStack(), requestCache);
   }
 
   /**
@@ -191,7 +202,7 @@ export class Container {
    */
   getNamed<T>(id: ServiceIdentifier<T>, name: string): T {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolve<T>(id, { named: name }, new Set(), requestCache);
+    return this._resolve<T>(id, { named: name }, this._createStack(), requestCache);
   }
 
   /**
@@ -202,7 +213,7 @@ export class Container {
     return this._resolve<T>(
       id,
       { tags: { [key]: value } },
-      new Set(),
+      this._createStack(),
       requestCache,
     );
   }
@@ -213,7 +224,7 @@ export class Container {
    */
   getAll<T>(id: ServiceIdentifier<T>): T[] {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolveAll<T>(id, new Set(), requestCache);
+    return this._resolveAll<T>(id, this._createStack(), requestCache);
   }
 
   // ──────────────────────── Async resolution ────────────────────────
@@ -224,7 +235,7 @@ export class Container {
    */
   async getAsync<T>(id: ServiceIdentifier<T>): Promise<T> {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolveAsync<T>(id, {}, new Set(), requestCache);
+    return this._resolveAsync<T>(id, {}, this._createStack(), requestCache);
   }
 
   // ──────────────────────── Private helpers ─────────────────────────
@@ -313,12 +324,12 @@ export class Container {
   private _resolve<T>(
     id: ServiceIdentifier<T>,
     constraints: { named?: string; tags?: Record<string, unknown> },
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T {
     // ── Circular dependency detection ──
     if (resolutionStack.has(id)) {
-      throw new CircularDependencyError([...resolutionStack, id]);
+      throw new CircularDependencyError([...resolutionStack.toArray(), id]);
     }
 
     const binding = this._selectBinding(id, constraints);
@@ -328,7 +339,7 @@ export class Container {
   private _resolveBinding<T>(
     binding: Binding<T>,
     id: ServiceIdentifier<T>,
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T {
     // ── Constant bindings short-circuit ──
@@ -349,7 +360,7 @@ export class Container {
     }
 
     // ── Resolve the value ──
-    const nextStack = new Set(resolutionStack).add(id);
+    const nextStack = resolutionStack.fork(id);
     let instance: T;
 
     if (binding.type === BindingType.Factory) {
@@ -382,7 +393,7 @@ export class Container {
    */
   private _resolveAll<T>(
     id: ServiceIdentifier<T>,
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T[] {
     let all = this._lookupAll(id) as Binding<T>[];
@@ -405,11 +416,11 @@ export class Container {
   private async _resolveAsync<T>(
     id: ServiceIdentifier<T>,
     constraints: { named?: string; tags?: Record<string, unknown> },
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): Promise<T> {
     if (resolutionStack.has(id)) {
-      throw new CircularDependencyError([...resolutionStack, id]);
+      throw new CircularDependencyError([...resolutionStack.toArray(), id]);
     }
 
     const binding = this._selectBinding(id, constraints);
@@ -430,7 +441,7 @@ export class Container {
       return requestCache.get(requestKey) as T;
     }
 
-    const nextStack = new Set(resolutionStack).add(id);
+    const nextStack = resolutionStack.fork(id);
     let instance: T;
 
     if (binding.type === BindingType.AsyncFactory) {
@@ -463,7 +474,7 @@ export class Container {
    */
   private _createInstance<T>(
     ctor: Constructor<T>,
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T {
     const metadata = (ctor as any)[Symbol.metadata];
@@ -502,7 +513,7 @@ export class Container {
    */
   private async _createInstanceAsync<T>(
     ctor: Constructor<T>,
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): Promise<T> {
     const metadata = (ctor as any)[Symbol.metadata];
@@ -551,7 +562,7 @@ export class Container {
   private _injectProperties(
     instance: any,
     metadata: Record<symbol, unknown>,
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): void {
     const propMap =
@@ -589,7 +600,7 @@ export class Container {
   private async _injectPropertiesAsync(
     instance: any,
     metadata: Record<symbol, unknown>,
-    resolutionStack: Set<ServiceIdentifier>,
+    resolutionStack: ResolutionStack,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): Promise<void> {
     const propMap =

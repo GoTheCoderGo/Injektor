@@ -29,6 +29,13 @@ export type {
   ContainerOptions,
 } from "./src/types.ts";
 
+// ── Resolution Stack ──
+export { SetResolutionStack, ArrayResolutionStack } from "./src/resolution-stack.ts";
+export type {
+  ResolutionStack,
+  ResolutionStrategy,
+} from "./src/resolution-stack.ts";
+
 // ── Errors ──
 export {
   ServiceNotFoundError,
