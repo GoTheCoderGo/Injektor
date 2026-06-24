@@ -183,7 +183,7 @@ export class Container {
    */
   get<T>(id: ServiceIdentifier<T>): T {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolve<T>(id, {}, [], requestCache);
+    return this._resolve<T>(id, {}, new Set(), requestCache);
   }
 
   /**
@@ -191,7 +191,7 @@ export class Container {
    */
   getNamed<T>(id: ServiceIdentifier<T>, name: string): T {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolve<T>(id, { named: name }, [], requestCache);
+    return this._resolve<T>(id, { named: name }, new Set(), requestCache);
   }
 
   /**
@@ -202,7 +202,7 @@ export class Container {
     return this._resolve<T>(
       id,
       { tags: { [key]: value } },
-      [],
+      new Set(),
       requestCache,
     );
   }
@@ -213,7 +213,7 @@ export class Container {
    */
   getAll<T>(id: ServiceIdentifier<T>): T[] {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolveAll<T>(id, [], requestCache);
+    return this._resolveAll<T>(id, new Set(), requestCache);
   }
 
   // ──────────────────────── Async resolution ────────────────────────
@@ -224,7 +224,7 @@ export class Container {
    */
   async getAsync<T>(id: ServiceIdentifier<T>): Promise<T> {
     const requestCache = new Map<ServiceIdentifier, unknown>();
-    return this._resolveAsync<T>(id, {}, [], requestCache);
+    return this._resolveAsync<T>(id, {}, new Set(), requestCache);
   }
 
   // ──────────────────────── Private helpers ─────────────────────────
@@ -313,11 +313,11 @@ export class Container {
   private _resolve<T>(
     id: ServiceIdentifier<T>,
     constraints: { named?: string; tags?: Record<string, unknown> },
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T {
     // ── Circular dependency detection ──
-    if (resolutionStack.includes(id)) {
+    if (resolutionStack.has(id)) {
       throw new CircularDependencyError([...resolutionStack, id]);
     }
 
@@ -328,7 +328,7 @@ export class Container {
   private _resolveBinding<T>(
     binding: Binding<T>,
     id: ServiceIdentifier<T>,
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T {
     // ── Constant bindings short-circuit ──
@@ -349,7 +349,7 @@ export class Container {
     }
 
     // ── Resolve the value ──
-    const nextStack = [...resolutionStack, id];
+    const nextStack = new Set(resolutionStack).add(id);
     let instance: T;
 
     if (binding.type === BindingType.Factory) {
@@ -382,7 +382,7 @@ export class Container {
    */
   private _resolveAll<T>(
     id: ServiceIdentifier<T>,
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T[] {
     let all = this._lookupAll(id) as Binding<T>[];
@@ -405,10 +405,10 @@ export class Container {
   private async _resolveAsync<T>(
     id: ServiceIdentifier<T>,
     constraints: { named?: string; tags?: Record<string, unknown> },
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): Promise<T> {
-    if (resolutionStack.includes(id)) {
+    if (resolutionStack.has(id)) {
       throw new CircularDependencyError([...resolutionStack, id]);
     }
 
@@ -430,7 +430,7 @@ export class Container {
       return requestCache.get(requestKey) as T;
     }
 
-    const nextStack = [...resolutionStack, id];
+    const nextStack = new Set(resolutionStack).add(id);
     let instance: T;
 
     if (binding.type === BindingType.AsyncFactory) {
@@ -463,7 +463,7 @@ export class Container {
    */
   private _createInstance<T>(
     ctor: Constructor<T>,
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): T {
     const metadata = (ctor as any)[Symbol.metadata];
@@ -502,7 +502,7 @@ export class Container {
    */
   private async _createInstanceAsync<T>(
     ctor: Constructor<T>,
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): Promise<T> {
     const metadata = (ctor as any)[Symbol.metadata];
@@ -551,7 +551,7 @@ export class Container {
   private _injectProperties(
     instance: any,
     metadata: Record<symbol, unknown>,
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): void {
     const propMap =
@@ -589,7 +589,7 @@ export class Container {
   private async _injectPropertiesAsync(
     instance: any,
     metadata: Record<symbol, unknown>,
-    resolutionStack: ServiceIdentifier[],
+    resolutionStack: Set<ServiceIdentifier>,
     requestCache: Map<ServiceIdentifier, unknown>,
   ): Promise<void> {
     const propMap =
