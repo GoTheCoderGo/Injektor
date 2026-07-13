@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "outDir": "./dist",
     // Environment setup & latest features
     "lib": ["ESNext"],
     "target": "ESNext",
@@ -13,7 +14,10 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
-    "noEmit": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+
+    "noEmit": false,
 
     // Best practices
     "strict": true,
