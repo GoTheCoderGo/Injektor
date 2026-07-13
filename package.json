@@ -1,5 +1,5 @@
 {
-  "name": "injektor",
+  "name": "@GoTheCoderGo/injektor",
   "module": "index.ts",
   "type": "module",
   "devDependencies": {
@@ -23,7 +23,14 @@
     "build": "([ -d dist ] && rm -r dist) ; bun x tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --outDir dist && bun build ./index.ts --outdir ./dist",
     "prepare": "( (bun x -p typescript@5.7.3 tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --noEmit) || exit 1) && bun run build",
     "prepublishOnly": "( (bun x -p typescript@5.7.3 tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --noEmit) || exit 1) && bun run build"
+  },
+
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:GoTheCoderGo/Injektor.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   }
-
-
 }
