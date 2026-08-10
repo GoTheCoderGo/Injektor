@@ -1,7 +1,8 @@
 {
-  "name": "@GoTheCoderGo/injektor",
+  "name": "@ilya_coder/injektor",
   "module": "index.ts",
   "type": "module",
+  "private": false,
   "devDependencies": {
     "@types/bun": "latest",
     "mitata": "^1.0.34",
@@ -28,12 +29,12 @@
     "prepublishOnly": "( (bun x -p typescript@5.7.3 tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --noEmit) || exit 1) && bun run build"
   },
 
-  "version": "1.0.1",
+  "version": "1.0.2",
   "repository": {
     "type": "git",
     "url": "git@github.com:GoTheCoderGo/Injektor.git"
   },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+    "registry": "https://registry.npmjs.org"
   }
 }
