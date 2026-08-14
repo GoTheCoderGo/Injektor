@@ -23,6 +23,18 @@ import type {
 Symbol.metadata ??= Symbol.for("Symbol.metadata");
 
 /**
+ * Retrieves or creates a Map on the metadata object as an own property,
+ * copying entries from the prototype chain if present.
+ */
+function getOwnMap<K, V>(metadata: Record<symbol, any>, key: symbol): Map<K, V> {
+  if (!Object.prototype.hasOwnProperty.call(metadata, key)) {
+    const parentMap = metadata[key] as Map<K, V> | undefined;
+    metadata[key] = parentMap ? new Map(parentMap) : new Map<K, V>();
+  }
+  return metadata[key];
+}
+
+/**
  * Options for the @injectable decorator.
  */
 export interface InjectableOptions {
@@ -56,11 +68,13 @@ export function injectable(options?: InjectableOptions) {
       context.metadata[SCOPE_KEY] = options.scope;
     }
     // Initialize metadata maps if they haven't been set by other decorators yet.
-    context.metadata[CONSTRUCTOR_INJECT_KEY] ??= [];
-    context.metadata[PROPERTY_INJECT_KEY] ??= new Map();
-    context.metadata[NAMED_INJECT_KEY] ??= new Map();
-    context.metadata[TAGGED_INJECT_KEY] ??= new Map();
-    context.metadata[MULTI_INJECT_KEY] ??= new Map();
+    if (!Object.prototype.hasOwnProperty.call(context.metadata, CONSTRUCTOR_INJECT_KEY)) {
+      context.metadata[CONSTRUCTOR_INJECT_KEY] ??= [];
+    }
+    getOwnMap(context.metadata, PROPERTY_INJECT_KEY);
+    getOwnMap(context.metadata, NAMED_INJECT_KEY);
+    getOwnMap(context.metadata, TAGGED_INJECT_KEY);
+    getOwnMap(context.metadata, MULTI_INJECT_KEY);
   };
 }
 
@@ -123,10 +137,10 @@ export function inject(token: ServiceIdentifier) {
       );
     }
 
-    // Initialize the property map if it doesn't exist yet
-    // (in case @inject runs before @injectable in decorator evaluation order).
-    context.metadata[PROPERTY_INJECT_KEY] ??= new Map();
-    const propMap = context.metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata;
+    const propMap = getOwnMap<string | symbol, ServiceIdentifier>(
+      context.metadata,
+      PROPERTY_INJECT_KEY,
+    );
     propMap.set(context.name, token);
   };
 }
@@ -154,8 +168,10 @@ export function named(name: string) {
       );
     }
 
-    context.metadata[NAMED_INJECT_KEY] ??= new Map();
-    const namedMap = context.metadata[NAMED_INJECT_KEY] as NamedInjectMetadata;
+    const namedMap = getOwnMap<string | symbol, string>(
+      context.metadata,
+      NAMED_INJECT_KEY,
+    );
     namedMap.set(context.name, name);
   };
 }
@@ -184,11 +200,12 @@ export function tagged(key: string, value: unknown) {
       );
     }
 
-    context.metadata[TAGGED_INJECT_KEY] ??= new Map();
-    const taggedMap = context.metadata[TAGGED_INJECT_KEY] as TaggedInjectMetadata;
-    const existing = taggedMap.get(context.name) ?? {};
-    existing[key] = value;
-    taggedMap.set(context.name, existing);
+    const taggedMap = getOwnMap<string | symbol, Record<string, unknown>>(
+      context.metadata,
+      TAGGED_INJECT_KEY,
+    );
+    const existing = taggedMap.get(context.name);
+    taggedMap.set(context.name, { ...existing, [key]: value });
   };
 }
 
@@ -214,8 +231,11 @@ export function multiInject(token: ServiceIdentifier) {
       );
     }
 
-    context.metadata[MULTI_INJECT_KEY] ??= new Map();
-    const multiMap = context.metadata[MULTI_INJECT_KEY] as MultiInjectMetadata;
+    const multiMap = getOwnMap<string | symbol, ServiceIdentifier>(
+      context.metadata,
+      MULTI_INJECT_KEY,
+    );
     multiMap.set(context.name, token);
   };
 }
+

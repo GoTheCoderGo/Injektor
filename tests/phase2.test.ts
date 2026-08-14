@@ -11,6 +11,7 @@ import {
   createToken,
   ServiceNotFoundError,
   AmbiguousBindingError,
+  AsyncBindingError,
 } from "../index.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,11 +267,11 @@ describe("Async resolution", () => {
     expect(weapon.name).toBe("Katana");
   });
 
-  it("should throw when trying to get() an async factory synchronously", () => {
+  it("should throw AsyncBindingError when trying to get() an async factory synchronously", () => {
     const c = new Container();
     c.bind(WEAPON).toAsyncFactory(async () => new Katana());
 
-    expect(() => c.get(WEAPON)).toThrow(/async factory/i);
+    expect(() => c.get(WEAPON)).toThrow(AsyncBindingError);
   });
 
   it("should resolve sync bindings via getAsync() too", async () => {
@@ -296,6 +297,77 @@ describe("Async resolution", () => {
     expect(w1).toBe(w2);
     expect(callCount).toBe(1);
   });
+
+  it("should prevent async singleton race conditions during concurrent resolutions", async () => {
+    let callCount = 0;
+    const c = new Container();
+    c.bind(WEAPON)
+      .toAsyncFactory(async () => {
+        callCount++;
+        await new Promise((r) => setTimeout(r, 10));
+        return new Katana();
+      })
+      .inSingletonScope();
+
+    // Fire 5 concurrent resolutions
+    const [w1, w2, w3, w4, w5] = await Promise.all([
+      c.getAsync(WEAPON),
+      c.getAsync(WEAPON),
+      c.getAsync(WEAPON),
+      c.getAsync(WEAPON),
+      c.getAsync(WEAPON),
+    ]);
+
+    expect(w1).toBe(w2);
+    expect(w2).toBe(w3);
+    expect(w3).toBe(w4);
+    expect(w4).toBe(w5);
+    expect(callCount).toBe(1);
+  });
+
+  it("should resolve getNamedAsync and getTaggedAsync", async () => {
+    const c = new Container();
+    c.bind(WEAPON)
+      .toAsyncFactory(async () => new Katana())
+      .whenNamed("melee");
+    c.bind(WEAPON)
+      .toAsyncFactory(async () => new Shuriken())
+      .whenTagged("range", "far");
+
+    const melee = await c.getNamedAsync(WEAPON, "melee");
+    expect(melee.name).toBe("Katana");
+
+    const ranged = await c.getTaggedAsync(WEAPON, "range", "far");
+    expect(ranged.name).toBe("Shuriken");
+  });
+
+  it("should resolve getAllAsync with mixed sync and async factories", async () => {
+    const c = new Container();
+    c.bind(WEAPON).to(Katana);
+    c.bind(WEAPON).toAsyncFactory(async () => new Shuriken());
+
+    const all = await c.getAllAsync(WEAPON);
+    expect(all).toHaveLength(2);
+    const names = all.map((w) => w.name).sort();
+    expect(names).toEqual(["Katana", "Shuriken"]);
+  });
+
+  it("should support @multiInject with async factories via getAsync", async () => {
+    @injectable()
+    class AsyncArsenal {
+      @multiInject(WEAPON) accessor weapons!: IWeapon[];
+    }
+
+    const c = new Container();
+    c.bind(WEAPON).to(Katana);
+    c.bind(WEAPON).toAsyncFactory(async () => new Shuriken());
+    c.bind(AsyncArsenal).toSelf();
+
+    const arsenal = await c.getAsync(AsyncArsenal);
+    expect(arsenal.weapons).toHaveLength(2);
+    const names = arsenal.weapons.map((w) => w.name).sort();
+    expect(names).toEqual(["Katana", "Shuriken"]);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -312,20 +384,31 @@ describe("Hierarchical containers", () => {
     expect(weapon.name).toBe("Katana");
   });
 
-  it("child bindings should override parent", () => {
+  it("child bindings should shadow parent for get() without throwing ambiguous error", () => {
     const parent = new Container();
     parent.bind(WEAPON).to(Katana);
 
     const child = new Container({ parent });
     child.bind(WEAPON).to(Shuriken);
 
-    // Child has its own binding — should not be ambiguous with parent
-    // because child lookup finds 1 local + 1 parent = 2 → ambiguous
-    // unless we design it so child-local shadows parent.
-    // Let's verify the behavior: child has Shuriken, parent has Katana → 2 bindings
-    // getAll returns both
+    // Child gets Shuriken (child shadows parent)
+    expect(child.get(WEAPON).name).toBe("Shuriken");
+    // Parent still gets Katana
+    expect(parent.get(WEAPON).name).toBe("Katana");
+    // Child getAll gets both
     const allWeapons = child.getAll(WEAPON);
     expect(allWeapons).toHaveLength(2);
+  });
+
+  it("child should fall back to parent for getNamed when child has no matching name", () => {
+    const parent = new Container();
+    parent.bind(WEAPON).to(Katana).whenNamed("melee");
+
+    const child = new Container({ parent });
+    child.bind(WEAPON).to(Shuriken).whenNamed("ranged");
+
+    expect(child.getNamed(WEAPON, "ranged").name).toBe("Shuriken");
+    expect(child.getNamed(WEAPON, "melee").name).toBe("Katana");
   });
 
   it("isBound should check parent chain", () => {

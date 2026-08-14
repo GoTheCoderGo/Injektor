@@ -36,4 +36,6 @@ export {
   InvalidDecoratorUsageError,
   NotInjectableError,
   AmbiguousBindingError,
+  InvalidBindingError,
+  AsyncBindingError,
 } from "./src/errors.ts";

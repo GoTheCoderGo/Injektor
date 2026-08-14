@@ -61,6 +61,8 @@ export interface Binding<T = unknown> {
   asyncFactory?: () => Promise<T>;
   /** Cached singleton instance. */
   cache?: T;
+  /** In-flight promise for async singleton resolution. */
+  pendingPromise?: Promise<T>;
   /** Named constraint for this binding. */
   name?: string;
   /** Tagged constraints for this binding. */

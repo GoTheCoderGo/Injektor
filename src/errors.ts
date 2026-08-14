@@ -66,3 +66,26 @@ export class AmbiguousBindingError extends Error {
     this.name = "AmbiguousBindingError";
   }
 }
+
+/**
+ * Thrown when an invalid binding configuration is encountered (e.g. toSelf() on non-constructor).
+ */
+export class InvalidBindingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidBindingError";
+  }
+}
+
+/**
+ * Thrown when an async binding is resolved synchronously with get().
+ */
+export class AsyncBindingError extends Error {
+  constructor(id: ServiceIdentifier) {
+    super(
+      `Binding for ${formatId(id)} is an async factory. Use container.getAsync() instead.`
+    );
+    this.name = "AsyncBindingError";
+  }
+}
+

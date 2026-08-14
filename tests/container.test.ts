@@ -10,6 +10,7 @@ import {
   NotInjectableError,
   InvalidDecoratorUsageError,
   AmbiguousBindingError,
+  InvalidBindingError,
   Scope,
 } from "../index.ts";
 
@@ -353,5 +354,43 @@ describe("Container", () => {
         class Bad {}
       }).toThrow(InvalidDecoratorUsageError);
     });
+
+    it("should throw InvalidBindingError when toSelf() is called on non-constructor", () => {
+      const c = new Container();
+      expect(() => c.bind(WEAPON).toSelf()).toThrow(InvalidBindingError);
+    });
+  });
+
+  // ── Class Inheritance ──
+
+  describe("inheritance", () => {
+    it("subclass property injection should not pollute parent class metadata", () => {
+      @injectable()
+      class BaseWarrior {
+        @inject(WEAPON) accessor weapon!: IWeapon;
+      }
+
+      @injectable()
+      class SubWarrior extends BaseWarrior {
+        @inject(ARMOR) accessor armor!: IArmor;
+      }
+
+      const c = new Container();
+      c.bind(WEAPON).to(Katana);
+      c.bind(ARMOR).to(ChainMail);
+      c.bind(BaseWarrior).toSelf();
+      c.bind(SubWarrior).toSelf();
+
+      // Base warrior should only have weapon injected
+      const base = c.get(BaseWarrior);
+      expect(base.weapon.name).toBe("Katana");
+      expect((base as any).armor).toBeUndefined();
+
+      // Sub warrior should have both weapon (inherited) and armor injected
+      const sub = c.get(SubWarrior);
+      expect(sub.weapon.name).toBe("Katana");
+      expect(sub.armor.defense).toBe(5);
+    });
   });
 });
+

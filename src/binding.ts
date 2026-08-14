@@ -1,6 +1,7 @@
 import type { Constructor, ServiceIdentifier, Binding } from "./types.ts";
 import { Scope, BindingType } from "./types.ts";
 import { SCOPE_KEY } from "./consts.ts";
+import { InvalidBindingError } from "./errors.ts";
 
 /**
  * Fluent API builder for configuring a binding.
@@ -56,7 +57,7 @@ export class BindingBuilder<T> {
   toSelf(): this {
     const id = this._binding.id;
     if (typeof id !== "function") {
-      throw new Error(
+      throw new InvalidBindingError(
         `toSelf() can only be used when the service identifier is a class constructor.`
       );
     }
