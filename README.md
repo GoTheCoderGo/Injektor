@@ -4,7 +4,8 @@ A lightweight, modern dependency injection library for TypeScript using Stage 3 
 
 ## Features
 
-- 📦 **Stage 3 Decorators:** Built for the modern TypeScript decorator specification (`Symbol.metadata`).
+- 🪶 **Zero Dependencies:** No runtime dependencies and no peer dependencies for end users.
+- 📦 **Stage 3 Decorators:** Built for standard Stage 3 decorators (`Symbol.metadata`).
 - 🏷️ **Type-safe Tokens:** Create injection tokens that carry type information for maximum safety.
 - 💉 **Flexible Injection:** Support for both constructor injection and property injection (using auto-accessors).
 - 🔄 **Scopes:** Control the lifecycle of your dependencies with Transient, Singleton, and Request scopes.
@@ -14,10 +15,16 @@ A lightweight, modern dependency injection library for TypeScript using Stage 3 
 ## Installation
 
 ```bash
-bun add injektor
+bun add @ilya_coder/injektor
+# or npm
+npm install @ilya_coder/injektor
+# or pnpm
+pnpm add @ilya_coder/injektor
 ```
 
-Ensure your `tsconfig.json` has `experimentalDecorators: false` (since injektor uses standard Stage 3 decorators) and targeting modern module resolution. The project uses `peerDependencies` requiring `typescript >= 5.7.0`.
+`injektor` is lightweight and has **zero runtime dependencies** and **no peer dependencies**.
+
+If you are using TypeScript (5.7+ recommended), ensure your `tsconfig.json` does not enable legacy experimental decorators (i.e. `experimentalDecorators: false` or omitted), as `injektor` uses standard Stage 3 decorators.
 
 ## Quick Start
 
@@ -26,7 +33,7 @@ Ensure your `tsconfig.json` has `experimentalDecorators: false` (since injektor 
 Use the `createToken` function to define type-safe tokens, and decorate your classes with `@injectable()`.
 
 ```typescript
-import { createToken, injectable, injectConstructor, inject } from "injektor";
+import { createToken, injectable, injectConstructor, inject } from "@ilya_coder/injektor";
 
 // Define interfaces
 export interface IWeapon {
@@ -76,7 +83,7 @@ export class Ninja {
 ### 3. Setup the Container and resolve
 
 ```typescript
-import { Container } from "injektor";
+import { Container } from "@ilya_coder/injektor";
 
 const container = new Container();
 
@@ -109,7 +116,7 @@ container.bind(Warrior).toSelf().inRequestScope();
 You can also define the default scope directly in the `@injectable` decorator:
 
 ```typescript
-import { Scope } from "injektor";
+import { Scope } from "@ilya_coder/injektor";
 
 @injectable({ scope: Scope.Singleton })
 export class Configuration {
