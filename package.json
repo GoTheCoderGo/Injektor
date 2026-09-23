@@ -1,6 +1,6 @@
 {
   "name": "@ilya_coder/injektor",
-  "module": "index.ts",
+  "module": "./dist/index.js",
   "type": "module",
   "private": false,
   "devDependencies": {
@@ -18,13 +18,18 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
   "scripts": {
-    "build": "([ -d dist ] && rm -r dist) ; bun x tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --outDir dist && bun build ./index.ts --outdir ./dist",
+    "build": "([ -d dist ] && rm -r dist) ; bun x tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --outDir dist && bun build ./index.ts --outfile ./dist/index.js --target node && bun build ./index.ts --outfile ./dist/index.cjs --format cjs --target node && printf '%s\\n' 'import * as injektor from \"./index.js\";' 'export = injektor;' > ./dist/index.d.cts",
     "prepare": "( (bun x -p typescript@5.7.3 tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --noEmit) || exit 1) && bun run build",
     "prepublishOnly": "( (bun x -p typescript@5.7.3 tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --noEmit) || exit 1) && bun run build"
   },

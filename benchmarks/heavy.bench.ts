@@ -2,7 +2,11 @@ import { run, bench, group } from "mitata";
 import { Container } from "../index.ts";
 import { INJECTABLE_KEY, CONSTRUCTOR_INJECT_KEY } from "../src/consts.ts";
 
-const METADATA_SYMBOL = Symbol.for("Symbol.metadata");
+// Importing the container installs the Symbol.metadata polyfill when the
+// runtime has no native symbol. A hard-coded Symbol.for("Symbol.metadata")
+// disagrees with runtimes whose native Symbol.metadata is a different symbol.
+// @ts-ignore Symbol.metadata is stage 3
+const METADATA_SYMBOL: symbol = Symbol.metadata;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Setup: Deep Linear Graph (100 levels)
@@ -115,8 +119,16 @@ group("Heavy: Exponential DAG (Depth 12, Branching 3)", () => {
     expContainer.get(ExpRoot);
   });
 
-  bench("Resolve Singleton (caches instances)", () => {
+  bench("Resolve Singleton warm cache hit", () => {
     expSingletonContainer.get(ExpRoot);
+  });
+
+  bench("Resolve Singleton cold", () => {
+    const c = new Container();
+    for (let i = 0; i < expClasses.length; i++) {
+      c.bind(expClasses[i]).toSelf().inSingletonScope();
+    }
+    c.get(ExpRoot);
   });
 });
 

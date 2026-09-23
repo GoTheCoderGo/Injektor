@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   INJECTABLE_KEY,
   CONSTRUCTOR_INJECT_KEY,
@@ -5,6 +6,7 @@ import {
   NAMED_INJECT_KEY,
   TAGGED_INJECT_KEY,
   MULTI_INJECT_KEY,
+  ACCESSOR_INJECT_KEY,
 } from "./consts.ts";
 import {
   ServiceNotFoundError,
@@ -12,6 +14,7 @@ import {
   NotInjectableError,
   AmbiguousBindingError,
   AsyncBindingError,
+  InvalidBindingError,
 } from "./errors.ts";
 import { BindingBuilder } from "./binding.ts";
 import { ContainerModule } from "./module.ts";
@@ -26,6 +29,7 @@ import type {
   NamedInjectMetadata,
   TaggedInjectMetadata,
   MultiInjectMetadata,
+  AccessorInjectMetadata,
   ContainerOptions,
 } from "./types.ts";
 import { Scope, BindingType } from "./types.ts";
@@ -34,9 +38,59 @@ import { Scope, BindingType } from "./types.ts";
 // @ts-ignore
 Symbol.metadata ??= Symbol.for("Symbol.metadata");
 
-/**
- * Normalise an `InjectArg` into an `InjectDescriptor`.
- */
+type Constraints = {
+  named?: string;
+  tags?: Record<string, unknown>;
+};
+
+type RequestEntry = {
+  settled: boolean;
+  value?: unknown;
+  promise?: Promise<unknown>;
+};
+
+type ResolutionContext = {
+  requestCache: Map<Binding, RequestEntry>;
+};
+
+/** One binding activation. Reentering the same object is a cycle; a different binding for the same token is not. */
+type Frame = {
+  binding: Binding;
+  parent?: Frame;
+};
+
+type Store = {
+  container: Container;
+  ctx: ResolutionContext;
+  frame?: Frame;
+  parentStore?: Store;
+};
+
+const resolutionStorage = new AsyncLocalStorage<Store>();
+
+function findStore(container: Container, store: Store | undefined): Store | undefined {
+  for (let current = store; current; current = current.parentStore) {
+    if (current.container === container) return current;
+  }
+  return undefined;
+}
+
+function frameHas(frame: Frame | undefined, binding: Binding): boolean {
+  for (let current = frame; current; current = current.parent) {
+    if (current.binding === binding) return true;
+  }
+  return false;
+}
+
+function cycleIds(frame: Frame | undefined, binding: Binding): ServiceIdentifier[] {
+  const frames: Frame[] = [];
+  for (let current = frame; current; current = current.parent) frames.push(current);
+  const ids: ServiceIdentifier[] = [];
+  for (let i = frames.length - 1; i >= 0; i--) ids.push(frames[i]!.binding.id);
+  ids.push(binding.id);
+  return ids;
+}
+
 function normalizeArg(arg: InjectArg): InjectDescriptor {
   if (
     typeof arg === "object" &&
@@ -49,13 +103,7 @@ function normalizeArg(arg: InjectArg): InjectDescriptor {
   return { token: arg as ServiceIdentifier };
 }
 
-/**
- * Check if a binding's tags match all required tags.
- */
-function tagsMatch(
-  binding: Binding,
-  requiredTags: Record<string, unknown>,
-): boolean {
+function tagsMatch(binding: Binding, requiredTags: Record<string, unknown>): boolean {
   if (!binding.tags) return false;
   for (const [key, value] of Object.entries(requiredTags)) {
     if (binding.tags[key] !== value) return false;
@@ -96,12 +144,14 @@ export class Container {
   /** Whether to automatically bind unregistered @injectable() classes. */
   private _autoBindInjectable: boolean;
 
+  /** Sync resolution state. Async resolution uses {@link resolutionStorage} so concurrent gets stay isolated. */
+  private _syncCtx?: ResolutionContext;
+  private _syncFrame?: Frame;
+
   constructor(options?: ContainerOptions) {
     this._parent = options?.parent;
     this._autoBindInjectable = options?.autoBindInjectable ?? false;
   }
-
-  // ──────────────────────── Binding registration ────────────────────────
 
   /**
    * Start configuring a binding for the given service identifier.
@@ -139,15 +189,16 @@ export class Container {
     return this._parent?.isBound(id) ?? false;
   }
 
-  // ──────────────────────── Module support ───────────────────────────
-
   /**
    * Load a `ContainerModule`, executing its registry callback.
    * Bindings added by the module can later be removed with `unload()`.
    */
   load(module: ContainerModule): void {
-    const registered: Binding[] = [];
+    if (this._moduleBindings.has(module)) {
+      throw new InvalidBindingError("Container module is already loaded.");
+    }
 
+    const registered: Binding[] = [];
     const bindFn = <T>(id: ServiceIdentifier<T>): BindingBuilder<T> => {
       return new BindingBuilder<T>(id, (binding) => {
         registered.push(binding as Binding);
@@ -155,13 +206,13 @@ export class Container {
       });
     };
 
-    module.registry(bindFn);
-    const existing = this._moduleBindings.get(module);
-    if (existing) {
-      existing.push(...registered);
-    } else {
-      this._moduleBindings.set(module, registered);
+    try {
+      module.registry(bindFn);
+    } catch (err) {
+      for (const binding of registered) this._removeBinding(binding);
+      throw err;
     }
+    this._moduleBindings.set(module, registered);
   }
 
   /**
@@ -177,8 +228,6 @@ export class Container {
     }
   }
 
-  // ──────────────────────── Synchronous resolution ──────────────────────
-
   /**
    * Resolve a single dependency by its service identifier.
    *
@@ -189,29 +238,21 @@ export class Container {
    * @throws {AsyncBindingError} if the binding is an async factory.
    */
   get<T>(id: ServiceIdentifier<T>): T {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolve<T>(id, {}, [], requestCache);
+    return this._runSync(() => this._resolve(id, {}));
   }
 
   /**
    * Resolve a dependency by service identifier + named constraint.
    */
   getNamed<T>(id: ServiceIdentifier<T>, name: string): T {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolve<T>(id, { named: name }, [], requestCache);
+    return this._runSync(() => this._resolve(id, { named: name }));
   }
 
   /**
    * Resolve a dependency by service identifier + tagged constraint.
    */
   getTagged<T>(id: ServiceIdentifier<T>, key: string, value: unknown): T {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolve<T>(
-      id,
-      { tags: { [key]: value } },
-      [],
-      requestCache,
-    );
+    return this._runSync(() => this._resolve(id, { tags: { [key]: value } }));
   }
 
   /**
@@ -219,27 +260,22 @@ export class Container {
    * Returns an array of resolved instances.
    */
   getAll<T>(id: ServiceIdentifier<T>): T[] {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolveAll<T>(id, [], requestCache);
+    return this._runSync(() => this._resolveAll(id, {}));
   }
-
-  // ──────────────────────── Async resolution ────────────────────────
 
   /**
    * Asynchronously resolve a dependency. Required for `AsyncFactory` bindings.
    * Also works with sync bindings (returns an immediately-resolved promise).
    */
   async getAsync<T>(id: ServiceIdentifier<T>): Promise<T> {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolveAsync<T>(id, {}, [], requestCache);
+    return this._runAsync(() => this._resolveAsync(id, {}));
   }
 
   /**
    * Asynchronously resolve a dependency by service identifier + named constraint.
    */
   async getNamedAsync<T>(id: ServiceIdentifier<T>, name: string): Promise<T> {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolveAsync<T>(id, { named: name }, [], requestCache);
+    return this._runAsync(() => this._resolveAsync(id, { named: name }));
   }
 
   /**
@@ -250,12 +286,8 @@ export class Container {
     key: string,
     value: unknown,
   ): Promise<T> {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolveAsync<T>(
-      id,
-      { tags: { [key]: value } },
-      [],
-      requestCache,
+    return this._runAsync(() =>
+      this._resolveAsync(id, { tags: { [key]: value } }),
     );
   }
 
@@ -264,13 +296,9 @@ export class Container {
    * Returns an array of resolved instances.
    */
   async getAllAsync<T>(id: ServiceIdentifier<T>): Promise<T[]> {
-    const requestCache = new Map<Binding, unknown>();
-    return this._resolveAllAsync<T>(id, [], requestCache);
+    return this._runAsync(() => this._resolveAllAsync(id, {}));
   }
 
-  // ──────────────────────── Private helpers ─────────────────────────
-
-  /** Add a binding to the internal multi-binding store. */
   private _addBinding(binding: Binding): void {
     const list = this._bindings.get(binding.id);
     if (list) {
@@ -280,7 +308,6 @@ export class Container {
     }
   }
 
-  /** Remove a specific binding object from the internal store. */
   private _removeBinding(binding: Binding): void {
     const list = this._bindings.get(binding.id);
     if (!list) return;
@@ -289,397 +316,417 @@ export class Container {
     if (list.length === 0) this._bindings.delete(binding.id);
   }
 
-  /**
-   * Look up all bindings for a token in this container and its parent chain.
-   */
   private _lookupAll(id: ServiceIdentifier): Binding[] {
     const local = this._bindings.get(id) ?? [];
     const parent = this._parent?._lookupAll(id) ?? [];
     return [...local, ...parent];
   }
 
-  /**
-   * Attempt to automatically bind a requested class if autobinding is enabled.
-   */
-  private _tryAutoBind(id: ServiceIdentifier): void {
-    if (this._autoBindInjectable && typeof id === "function") {
-      const metadata = (id as any)[Symbol.metadata];
-      if (metadata && metadata[INJECTABLE_KEY] === true) {
-        this.bind(id as Constructor).toSelf();
-      }
-    }
+  private _tryAutoBind(id: ServiceIdentifier): Binding | undefined {
+    if (!this._autoBindInjectable || typeof id !== "function") return undefined;
+    const metadata = (id as Constructor)[Symbol.metadata] as
+      | Record<symbol, unknown>
+      | undefined;
+    if (!metadata || metadata[INJECTABLE_KEY] !== true) return undefined;
+    const before = this._bindings.get(id)?.length ?? 0;
+    this.bind(id as Constructor).toSelf();
+    const list = this._bindings.get(id);
+    if (!list || list.length <= before) return undefined;
+    return list[list.length - 1];
   }
 
-  /**
-   * Filter a list of bindings against named and tagged constraints.
-   */
-  private _filterBindings<T>(
-    bindings: Binding<T>[],
-    constraints: { named?: string; tags?: Record<string, unknown> },
-  ): Binding<T>[] {
+  private _filterBindings<T>(bindings: Binding<T>[], constraints: Constraints): Binding<T>[] {
     let candidates = bindings;
     if (constraints.named !== undefined) {
       candidates = candidates.filter((b) => b.name === constraints.named);
     }
     if (constraints.tags !== undefined) {
-      candidates = candidates.filter((b) => tagsMatch(b, constraints.tags!));
+      const tags = constraints.tags;
+      candidates = candidates.filter((b) => tagsMatch(b, tags));
     }
     return candidates;
   }
 
   /**
-   * Select a single binding matching optional constraints.
-   * Prioritizes local bindings before delegating to the parent container.
+   * Parent bindings win over autobind. An autobound class that does not
+   * satisfy the constraint is removed so a failed named lookup cannot
+   * stick an unnamed binding.
    */
-  private _selectBinding<T>(
-    id: ServiceIdentifier<T>,
-    constraints: { named?: string; tags?: Record<string, unknown> },
-  ): Binding<T> {
+  private _selectBinding<T>(id: ServiceIdentifier<T>, constraints: Constraints): Binding<T> {
     const local = (this._bindings.get(id) ?? []) as Binding<T>[];
     const localCandidates = this._filterBindings(local, constraints);
 
-    if (localCandidates.length === 1) {
-      return localCandidates[0]!;
-    }
-
+    if (localCandidates.length === 1) return localCandidates[0]!;
     if (localCandidates.length > 1) {
       throw new AmbiguousBindingError(id, localCandidates.length);
     }
 
-    // If no local bindings exist, attempt autobinding locally
-    if (local.length === 0) {
-      this._tryAutoBind(id);
-      const afterAuto = (this._bindings.get(id) ?? []) as Binding<T>[];
-      const autoCandidates = this._filterBindings(afterAuto, constraints);
-      if (autoCandidates.length === 1) {
-        return autoCandidates[0]!;
-      }
-      if (autoCandidates.length > 1) {
-        throw new AmbiguousBindingError(id, autoCandidates.length);
+    if (this._parent) {
+      try {
+        return this._parent._selectBinding(id, constraints);
+      } catch (err) {
+        if (!(err instanceof ServiceNotFoundError)) throw err;
       }
     }
 
-    // If local had no matching binding, delegate to parent container
-    if (this._parent) {
-      return this._parent._selectBinding(id, constraints);
+    if (local.length === 0) {
+      const created = this._tryAutoBind(id) as Binding<T> | undefined;
+      if (created && this._filterBindings([created], constraints).length === 1) {
+        return created;
+      }
+      if (created) this._removeBinding(created);
     }
 
     throw new ServiceNotFoundError(id);
   }
 
-  // ──────────────────────── Sync resolution core ────────────────────────
+  private _owns(binding: Binding): boolean {
+    return this._bindings.get(binding.id)?.includes(binding) ?? false;
+  }
 
-  private _resolve<T>(
-    id: ServiceIdentifier<T>,
-    constraints: { named?: string; tags?: Record<string, unknown> },
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
-  ): T {
-    // ── Circular dependency detection ──
-    if (resolutionStack.includes(id)) {
-      throw new CircularDependencyError([...resolutionStack, id]);
+  private _owner(binding: Binding): Container {
+    if (this._owns(binding)) return this;
+    if (this._parent) return this._parent._owner(binding);
+    return this;
+  }
+
+  /** Singletons are built by the container that registered them, so a child cannot publish its own instance into the shared binding. */
+  private _isForeignSingleton(binding: Binding): boolean {
+    return binding.scope === Scope.Singleton && !this._owns(binding);
+  }
+
+  private _runSync<T>(fn: () => T): T {
+    if (findStore(this, resolutionStorage.getStore()) || this._syncCtx) return fn();
+    this._syncCtx = { requestCache: new Map() };
+    this._syncFrame = undefined;
+    try {
+      return fn();
+    } finally {
+      this._syncCtx = undefined;
+      this._syncFrame = undefined;
     }
+  }
 
+  private _runAsync<T>(fn: () => Promise<T>): Promise<T> {
+    if (findStore(this, resolutionStorage.getStore())) return fn();
+    const parentStore = resolutionStorage.getStore();
+    if (this._syncCtx) {
+      const store: Store = {
+        container: this,
+        ctx: this._syncCtx,
+        frame: this._syncFrame,
+        parentStore,
+      };
+      return resolutionStorage.run(store, fn);
+    }
+    const ctx: ResolutionContext = { requestCache: new Map() };
+    const store: Store = { container: this, ctx, frame: undefined, parentStore };
+    return resolutionStorage.run(store, fn);
+  }
+
+  private _currentCtx(): ResolutionContext {
+    const found = findStore(this, resolutionStorage.getStore());
+    const ctx = found?.ctx ?? this._syncCtx;
+    if (!ctx) {
+      throw new Error("Injektor: resolution context is missing.");
+    }
+    return ctx;
+  }
+
+  private _currentFrame(): Frame | undefined {
+    const found = findStore(this, resolutionStorage.getStore());
+    if (found) return found.frame;
+    return this._syncFrame;
+  }
+
+  private _withFrame<T>(frame: Frame, fn: () => T): T {
+    const current = resolutionStorage.getStore();
+    const found = findStore(this, current);
+    if (found) {
+      const store: Store = {
+        container: this,
+        ctx: found.ctx,
+        frame,
+        parentStore: current,
+      };
+      return resolutionStorage.run(store, fn);
+    }
+    const prev = this._syncFrame;
+    this._syncFrame = frame;
+    try {
+      return fn();
+    } finally {
+      this._syncFrame = prev;
+    }
+  }
+
+  private _resolve<T>(id: ServiceIdentifier<T>, constraints: Constraints): T {
     const binding = this._selectBinding(id, constraints);
-    return this._resolveBinding<T>(binding, id, resolutionStack, requestCache);
+    if (this._isForeignSingleton(binding)) {
+      const owner = this._owner(binding);
+      return owner._runSync(() => owner._resolveBindingSync(binding, id));
+    }
+    return this._resolveBindingSync(binding, id);
   }
 
-  private _resolveBinding<T>(
-    binding: Binding<T>,
+  private _resolveAsync<T>(
     id: ServiceIdentifier<T>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
-  ): T {
-    // ── Constant bindings short-circuit ──
-    if (binding.type === BindingType.Constant) {
-      return binding.value as T;
+    constraints: Constraints,
+  ): Promise<T> {
+    const binding = this._selectBinding(id, constraints);
+    if (this._isForeignSingleton(binding)) {
+      const owner = this._owner(binding);
+      return owner._runAsync(() => owner._resolveBindingAsync(binding, id));
     }
-
-    // ── Singleton cache hit ──
-    if (binding.scope === Scope.Singleton && binding.cache !== undefined) {
-      return binding.cache;
-    }
-
-    // ── Request-scope cache hit ──
-    if (binding.scope === Scope.Request && requestCache.has(binding)) {
-      return requestCache.get(binding) as T;
-    }
-
-    // ── Resolve the value ──
-    const nextStack = [...resolutionStack, id];
-    let instance: T;
-
-    if (binding.type === BindingType.Factory) {
-      instance = binding.factory!();
-    } else if (binding.type === BindingType.AsyncFactory) {
-      throw new AsyncBindingError(id);
-    } else {
-      // BindingType.Instance
-      instance = this._createInstance<T>(
-        binding.implementationClass!,
-        nextStack,
-        requestCache,
-      );
-    }
-
-    // ── Cache by scope ──
-    if (binding.scope === Scope.Singleton) {
-      binding.cache = instance;
-    } else if (binding.scope === Scope.Request) {
-      requestCache.set(binding, instance);
-    }
-
-    return instance;
+    return this._resolveBindingAsync(binding, id);
   }
 
-  /**
-   * Resolve all bindings for a token as an array.
-   */
-  private _resolveAll<T>(
-    id: ServiceIdentifier<T>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
-  ): T[] {
+  private _matchingBindings<T>(id: ServiceIdentifier<T>, constraints: Constraints): Binding<T>[] {
     let all = this._lookupAll(id) as Binding<T>[];
-
     if (all.length === 0) {
-      this._tryAutoBind(id);
+      const created = this._tryAutoBind(id) as Binding<T> | undefined;
       all = this._lookupAll(id) as Binding<T>[];
+      const matched = this._filterBindings(all, constraints);
+      if (matched.length === 0) {
+        if (created) this._removeBinding(created);
+        throw new ServiceNotFoundError(id);
+      }
+      return matched;
     }
-
-    if (all.length === 0) {
-      throw new ServiceNotFoundError(id);
-    }
-    return all.map((binding) =>
-      this._resolveBinding(binding, id, resolutionStack, requestCache),
-    );
+    const matched = this._filterBindings(all, constraints);
+    if (matched.length === 0) throw new ServiceNotFoundError(id);
+    return matched;
   }
 
-  // ──────────────────────── Async resolution core ───────────────────────
-
-  private async _resolveAsync<T>(
-    id: ServiceIdentifier<T>,
-    constraints: { named?: string; tags?: Record<string, unknown> },
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
-  ): Promise<T> {
-    if (resolutionStack.includes(id)) {
-      throw new CircularDependencyError([...resolutionStack, id]);
-    }
-
-    const binding = this._selectBinding(id, constraints);
-    return this._resolveBindingAsync<T>(
-      binding,
-      id,
-      resolutionStack,
-      requestCache,
-    );
+  private _resolveAll<T>(id: ServiceIdentifier<T>, constraints: Constraints): T[] {
+    return this._matchingBindings(id, constraints).map((binding) => {
+      if (this._isForeignSingleton(binding)) {
+        const owner = this._owner(binding);
+        return owner._runSync(() => owner._resolveBindingSync(binding, id));
+      }
+      return this._resolveBindingSync(binding, id);
+    });
   }
 
-  private async _resolveBindingAsync<T>(
-    binding: Binding<T>,
-    id: ServiceIdentifier<T>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
-  ): Promise<T> {
-    // ── Constant ──
-    if (binding.type === BindingType.Constant) {
-      return binding.value as T;
-    }
-
-    // ── Singleton cache hit ──
-    if (binding.scope === Scope.Singleton) {
-      if (binding.cache !== undefined) {
-        return binding.cache;
-      }
-      if (binding.pendingPromise !== undefined) {
-        return binding.pendingPromise;
-      }
-    }
-
-    // ── Request-scope cache hit ──
-    if (binding.scope === Scope.Request && requestCache.has(binding)) {
-      return requestCache.get(binding) as T;
-    }
-
-    const nextStack = [...resolutionStack, id];
-
-    if (binding.scope === Scope.Singleton) {
-      const promise = (async () => {
-        let instance: T;
-        if (binding.type === BindingType.AsyncFactory) {
-          instance = await binding.asyncFactory!();
-        } else if (binding.type === BindingType.Factory) {
-          instance = binding.factory!();
-        } else {
-          instance = await this._createInstanceAsync<T>(
-            binding.implementationClass!,
-            nextStack,
-            requestCache,
-          );
-        }
-        binding.cache = instance;
-        binding.pendingPromise = undefined;
-        return instance;
-      })();
-
-      binding.pendingPromise = promise;
-      try {
-        return await promise;
-      } catch (err) {
-        binding.pendingPromise = undefined;
-        throw err;
-      }
-    }
-
-    let instance: T;
-    if (binding.type === BindingType.AsyncFactory) {
-      instance = await binding.asyncFactory!();
-    } else if (binding.type === BindingType.Factory) {
-      instance = binding.factory!();
-    } else {
-      instance = await this._createInstanceAsync<T>(
-        binding.implementationClass!,
-        nextStack,
-        requestCache,
-      );
-    }
-
-    // ── Cache by scope ──
-    if (binding.scope === Scope.Request) {
-      requestCache.set(binding, instance);
-    }
-
-    return instance;
-  }
-
-  /**
-   * Resolve all bindings for a token asynchronously as an array.
-   */
   private async _resolveAllAsync<T>(
     id: ServiceIdentifier<T>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
+    constraints: Constraints,
   ): Promise<T[]> {
-    let all = this._lookupAll(id) as Binding<T>[];
-
-    if (all.length === 0) {
-      this._tryAutoBind(id);
-      all = this._lookupAll(id) as Binding<T>[];
-    }
-
-    if (all.length === 0) {
-      throw new ServiceNotFoundError(id);
-    }
-
+    const bindings = this._matchingBindings(id, constraints);
     return Promise.all(
-      all.map((binding) =>
-        this._resolveBindingAsync(binding, id, resolutionStack, requestCache),
-      ),
+      bindings.map((binding) => {
+        if (this._isForeignSingleton(binding)) {
+          const owner = this._owner(binding);
+          return owner._runAsync(() => owner._resolveBindingAsync(binding, id));
+        }
+        return this._resolveBindingAsync(binding, id);
+      }),
     );
   }
 
-  // ──────────────────────── Instance creation ───────────────────────────
+  private _resolveBindingSync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): T {
+    if (binding.type === BindingType.Constant) return binding.value as T;
+
+    const ctx = this._currentCtx();
+    if (binding.scope === Scope.Singleton && binding.cached) {
+      return binding.cache as T;
+    }
+
+    const requestEntry =
+      binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
+    if (requestEntry) {
+      if (!requestEntry.settled) throw new AsyncBindingError(id);
+      return requestEntry.value as T;
+    }
+
+    const caller = this._currentFrame();
+    if (frameHas(caller, binding)) {
+      throw new CircularDependencyError(cycleIds(caller, binding));
+    }
+
+    const frame: Frame = { binding, parent: caller };
+    return this._withFrame(frame, () => {
+      const instance = this._produceSync(binding, id);
+      if (binding.scope === Scope.Singleton) {
+        binding.cache = instance;
+        binding.cached = true;
+      } else if (binding.scope === Scope.Request) {
+        ctx.requestCache.set(binding, { settled: true, value: instance });
+      }
+      return instance;
+    });
+  }
+
+  private _resolveBindingAsync<T>(
+    binding: Binding<T>,
+    id: ServiceIdentifier<T>,
+  ): Promise<T> {
+    if (binding.type === BindingType.Constant) {
+      return Promise.resolve(binding.value as T);
+    }
+
+    const ctx = this._currentCtx();
+    if (binding.scope === Scope.Singleton && binding.cached) {
+      return Promise.resolve(binding.cache as T);
+    }
+
+    // Reentry of the binding now being constructed is a cycle. A sibling
+    // lookup is not on this frame, so it may share the in-flight promise.
+    const caller = this._currentFrame();
+    if (frameHas(caller, binding)) {
+      throw new CircularDependencyError(cycleIds(caller, binding));
+    }
+
+    if (binding.scope === Scope.Singleton && binding.pendingPromise) {
+      return binding.pendingPromise as Promise<T>;
+    }
+
+    const requestEntry =
+      binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
+    if (requestEntry) {
+      if (requestEntry.settled) return Promise.resolve(requestEntry.value as T);
+      return requestEntry.promise as Promise<T>;
+    }
+
+    const frame: Frame = { binding, parent: caller };
+    const store: Store = {
+      container: this,
+      ctx,
+      frame,
+      parentStore: resolutionStorage.getStore(),
+    };
+
+    return resolutionStorage.run(store, async () => {
+      if (binding.scope === Scope.Singleton) {
+        return this._resolveSingletonAsync(binding, id);
+      }
+      if (binding.scope === Scope.Request) {
+        return this._resolveRequestAsync(binding, id, ctx);
+      }
+      return this._produceAsync(binding, id);
+    });
+  }
 
   /**
-   * Instantiate a class, resolving constructor and property dependencies (sync).
+   * Publish the promise before the first await. Concurrent callers share it;
+   * a reentrant caller hits the frame check above and throws instead of awaiting itself.
    */
-  private _createInstance<T>(
-    ctor: Constructor<T>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
-  ): T {
-    const metadata = (ctor as any)[Symbol.metadata];
+  private async _resolveSingletonAsync<T>(
+    binding: Binding<T>,
+    id: ServiceIdentifier<T>,
+  ): Promise<T> {
+    let settle!: (value: T) => void;
+    let fail!: (err: unknown) => void;
+    const pending = new Promise<T>((resolve, reject) => {
+      settle = resolve;
+      fail = reject;
+    });
+    // The caller awaits this method, not `pending`. Mark the rejection handled
+    // when nobody else is waiting, without hiding it from concurrent callers.
+    pending.catch(() => {});
+    binding.pendingPromise = pending;
+    try {
+      const instance = await this._produceAsync(binding, id);
+      binding.cache = instance;
+      binding.cached = true;
+      settle(instance);
+      return instance;
+    } catch (err) {
+      fail(err);
+      throw err;
+    } finally {
+      binding.pendingPromise = undefined;
+    }
+  }
 
+  /** Reserve the request entry before awaiting so concurrent deps in one graph share one instance. */
+  private async _resolveRequestAsync<T>(
+    binding: Binding<T>,
+    id: ServiceIdentifier<T>,
+    ctx: ResolutionContext,
+  ): Promise<T> {
+    let settle!: (value: T) => void;
+    let fail!: (err: unknown) => void;
+    const pending = new Promise<T>((resolve, reject) => {
+      settle = resolve;
+      fail = reject;
+    });
+    pending.catch(() => {});
+    ctx.requestCache.set(binding, { settled: false, promise: pending });
+    try {
+      const instance = await this._produceAsync(binding, id);
+      ctx.requestCache.set(binding, { settled: true, value: instance });
+      settle(instance);
+      return instance;
+    } catch (err) {
+      fail(err);
+      throw err;
+    }
+  }
+
+  private _produceSync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): T {
+    if (binding.type === BindingType.Factory) return binding.factory!() as T;
+    if (binding.type === BindingType.AsyncFactory) throw new AsyncBindingError(id);
+    return this._createInstance(binding.implementationClass as Constructor<T>);
+  }
+
+  private async _produceAsync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): Promise<T> {
+    if (binding.type === BindingType.AsyncFactory) {
+      return binding.asyncFactory!() as Promise<T>;
+    }
+    if (binding.type === BindingType.Factory) return binding.factory!() as T;
+    return this._createInstanceAsync(binding.implementationClass as Constructor<T>);
+  }
+
+  private _createInstance<T>(ctor: Constructor<T>): T {
+    const metadata = ctor[Symbol.metadata] as Record<symbol, unknown> | undefined;
     if (!metadata || metadata[INJECTABLE_KEY] !== true) {
       throw new NotInjectableError(ctor);
     }
 
-    // ── Resolve constructor arguments ──
-    const ctorArgs =
-      (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
+    const ctorArgs = (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
     const args = ctorArgs.map((arg) => {
       const desc = normalizeArg(arg);
       if (desc.multi) {
-        return this._resolveAll(desc.token, resolutionStack, requestCache);
+        return this._resolveAll(desc.token, { named: desc.named, tags: desc.tags });
       }
-      return this._resolve(
-        desc.token,
-        { named: desc.named, tags: desc.tags },
-        resolutionStack,
-        requestCache,
-      );
+      return this._resolve(desc.token, { named: desc.named, tags: desc.tags });
     });
 
-    // ── Instantiate ──
     const instance = new ctor(...args);
-
-    // ── Property injection ──
-    this._injectProperties(instance, metadata, resolutionStack, requestCache);
-
+    this._injectProperties(instance as object, ctor, metadata);
     return instance;
   }
 
-  /**
-   * Instantiate a class, resolving constructor and property dependencies (async).
-   */
-  private async _createInstanceAsync<T>(
-    ctor: Constructor<T>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
-  ): Promise<T> {
-    const metadata = (ctor as any)[Symbol.metadata];
-
+  private async _createInstanceAsync<T>(ctor: Constructor<T>): Promise<T> {
+    const metadata = ctor[Symbol.metadata] as Record<symbol, unknown> | undefined;
     if (!metadata || metadata[INJECTABLE_KEY] !== true) {
       throw new NotInjectableError(ctor);
     }
 
-    // ── Resolve constructor arguments (async) ──
-    const ctorArgs =
-      (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
+    const ctorArgs = (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
     const args = await Promise.all(
       ctorArgs.map((arg) => {
         const desc = normalizeArg(arg);
         if (desc.multi) {
-          return this._resolveAllAsync(
-            desc.token,
-            resolutionStack,
-            requestCache,
-          );
+          return this._resolveAllAsync(desc.token, {
+            named: desc.named,
+            tags: desc.tags,
+          });
         }
-        return this._resolveAsync(
-          desc.token,
-          { named: desc.named, tags: desc.tags },
-          resolutionStack,
-          requestCache,
-        );
+        return this._resolveAsync(desc.token, { named: desc.named, tags: desc.tags });
       }),
     );
 
-    // ── Instantiate ──
     const instance = new ctor(...args);
-
-    // ── Property injection (async) ──
-    await this._injectPropertiesAsync(
-      instance,
-      metadata,
-      resolutionStack,
-      requestCache,
-    );
-
+    await this._injectPropertiesAsync(instance as object, ctor, metadata);
     return instance;
   }
 
-  // ──────────────────────── Property injection ──────────────────────────
-
-  /**
-   * Inject all decorated properties on an instance (sync).
-   */
   private _injectProperties(
-    instance: any,
+    instance: object,
+    ctor: Constructor,
     metadata: Record<symbol, unknown>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
   ): void {
     const propMap =
       (metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata) ?? new Map();
@@ -690,34 +737,27 @@ export class Container {
     const multiMap =
       (metadata[MULTI_INJECT_KEY] as MultiInjectMetadata) ?? new Map();
 
-    // @inject() properties
     for (const [fieldName, token] of propMap) {
-      const name = namedMap.get(fieldName);
-      const tags = taggedMap.get(fieldName);
-      const value = this._resolve(
-        token,
-        { named: name, tags },
-        resolutionStack,
-        requestCache,
-      );
-      instance[fieldName] = value;
+      const value = this._resolve(token, {
+        named: namedMap.get(fieldName),
+        tags: taggedMap.get(fieldName),
+      });
+      this._assign(instance, ctor, metadata, fieldName, value);
     }
 
-    // @multiInject() properties
     for (const [fieldName, token] of multiMap) {
-      const value = this._resolveAll(token, resolutionStack, requestCache);
-      instance[fieldName] = value;
+      const value = this._resolveAll(token, {
+        named: namedMap.get(fieldName),
+        tags: taggedMap.get(fieldName),
+      });
+      this._assign(instance, ctor, metadata, fieldName, value);
     }
   }
 
-  /**
-   * Inject all decorated properties on an instance (async).
-   */
   private async _injectPropertiesAsync(
-    instance: any,
+    instance: object,
+    ctor: Constructor,
     metadata: Record<symbol, unknown>,
-    resolutionStack: ServiceIdentifier[],
-    requestCache: Map<Binding, unknown>,
   ): Promise<void> {
     const propMap =
       (metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata) ?? new Map();
@@ -728,27 +768,36 @@ export class Container {
     const multiMap =
       (metadata[MULTI_INJECT_KEY] as MultiInjectMetadata) ?? new Map();
 
-    // @inject() properties
     for (const [fieldName, token] of propMap) {
-      const name = namedMap.get(fieldName);
-      const tags = taggedMap.get(fieldName);
-      const value = await this._resolveAsync(
-        token,
-        { named: name, tags },
-        resolutionStack,
-        requestCache,
-      );
-      instance[fieldName] = value;
+      const value = await this._resolveAsync(token, {
+        named: namedMap.get(fieldName),
+        tags: taggedMap.get(fieldName),
+      });
+      this._assign(instance, ctor, metadata, fieldName, value);
     }
 
-    // @multiInject() properties
     for (const [fieldName, token] of multiMap) {
-      const values = await this._resolveAllAsync(
-        token,
-        resolutionStack,
-        requestCache,
-      );
-      instance[fieldName] = values;
+      const values = await this._resolveAllAsync(token, {
+        named: namedMap.get(fieldName),
+        tags: taggedMap.get(fieldName),
+      });
+      this._assign(instance, ctor, metadata, fieldName, values);
     }
+  }
+
+  private _assign(
+    instance: object,
+    ctor: Constructor,
+    metadata: Record<symbol, unknown>,
+    fieldName: string | symbol,
+    value: unknown,
+  ): void {
+    const accessors = metadata[ACCESSOR_INJECT_KEY] as AccessorInjectMetadata | undefined;
+    const info = accessors?.get(fieldName);
+    if (info) {
+      info.set(info.static ? (info.home ?? ctor) : instance, value);
+      return;
+    }
+    (instance as Record<string | symbol, unknown>)[fieldName] = value;
   }
 }

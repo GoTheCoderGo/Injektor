@@ -59,8 +59,13 @@ export interface Binding<T = unknown> {
   factory?: () => T;
   /** The async factory function (for AsyncFactory bindings). */
   asyncFactory?: () => Promise<T>;
-  /** Cached singleton instance. */
+  /**
+   * Cached singleton instance.
+   * Only meaningful when `cached` is true, so a stored `undefined` is a hit.
+   */
   cache?: T;
+  /** True after a singleton value has been stored. */
+  cached?: boolean;
   /** In-flight promise for async singleton resolution. */
   pendingPromise?: Promise<T>;
   /** Named constraint for this binding. */
@@ -117,6 +122,21 @@ export type TaggedInjectMetadata = Map<string | symbol, Record<string, unknown>>
  * Maps field name → service identifier token.
  */
 export type MultiInjectMetadata = Map<string | symbol, ServiceIdentifier>;
+
+/**
+ * How to write an injected value through the accessor the decorator observed.
+ * `set` is `context.access.set`, which reaches private fields; assigning
+ * `instance[name]` does not.
+ */
+export interface AccessorInjectInfo {
+  set: (receiver: unknown, value: unknown) => void;
+  static: boolean;
+  /** Class a static accessor was declared on. */
+  home?: Function;
+}
+
+/** Map of field name → accessor write target. */
+export type AccessorInjectMetadata = Map<string | symbol, AccessorInjectInfo>;
 
 /**
  * Options for the Container constructor.

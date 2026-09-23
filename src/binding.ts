@@ -21,6 +21,8 @@ import { InvalidBindingError } from "./errors.ts";
 export class BindingBuilder<T> {
   private readonly _binding: Binding<T>;
   private _committed = false;
+  /** Set when the caller picks a scope, so a later `to()` does not replace it. */
+  private _scopeExplicit = false;
 
   constructor(
     id: ServiceIdentifier<T>,
@@ -42,9 +44,16 @@ export class BindingBuilder<T> {
     this._binding.type = BindingType.Instance;
     this._binding.implementationClass = impl;
 
-    const metadata = (impl as any)[Symbol.metadata];
-    if (metadata && metadata[SCOPE_KEY]) {
-      this._binding.scope = metadata[SCOPE_KEY] as Scope;
+    if (!this._scopeExplicit) {
+      const metadata = (impl as any)[Symbol.metadata];
+      // Own property only: a subclass metadata object prototypes to the base,
+      // and inheriting the base scope is not a scope the subclass declared.
+      if (
+        metadata &&
+        Object.prototype.hasOwnProperty.call(metadata, SCOPE_KEY)
+      ) {
+        this._binding.scope = metadata[SCOPE_KEY] as Scope;
+      }
     }
 
     this._commitOnce();
@@ -104,6 +113,7 @@ export class BindingBuilder<T> {
    */
   inSingletonScope(): this {
     this._binding.scope = Scope.Singleton;
+    this._scopeExplicit = true;
     return this;
   }
 
@@ -113,6 +123,7 @@ export class BindingBuilder<T> {
    */
   inTransientScope(): this {
     this._binding.scope = Scope.Transient;
+    this._scopeExplicit = true;
     return this;
   }
 
@@ -122,6 +133,7 @@ export class BindingBuilder<T> {
    */
   inRequestScope(): this {
     this._binding.scope = Scope.Request;
+    this._scopeExplicit = true;
     return this;
   }
 

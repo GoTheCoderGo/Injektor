@@ -21,5 +21,8 @@ export const TAGGED_INJECT_KEY = Symbol("injektor:taggedInject");
 /** Map of field name → service identifier for multi-inject property injection. */
 export const MULTI_INJECT_KEY = Symbol("injektor:multiInject");
 
+/** Map of field name → accessor setter captured at decoration time. */
+export const ACCESSOR_INJECT_KEY = Symbol("injektor:accessor");
+
 /** Scope defined via @injectable() options. */
 export const SCOPE_KEY = Symbol("injektor:scope");

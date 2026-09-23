@@ -1,5 +1,5 @@
 import { run, bench, group } from "mitata";
-import { Container, injectable, injectConstructor, Scope } from "../index.ts";
+import { Container, injectable, injectConstructor } from "../index.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Setup Fixtures
@@ -46,8 +46,14 @@ container.bind(Controller).toSelf().inTransientScope();
 // ─────────────────────────────────────────────────────────────────────────────
 
 group("Injektor Container Resolution", () => {
-  bench("Singleton Resolution (Config)", () => {
+  bench("Singleton Resolution warm cache hit (Config)", () => {
     container.get(Config);
+  });
+
+  bench("Singleton Resolution cold (Config)", () => {
+    const c = new Container();
+    c.bind(Config).toSelf().inSingletonScope();
+    c.get(Config);
   });
 
   bench("Transient Resolution (Repository)", () => {
