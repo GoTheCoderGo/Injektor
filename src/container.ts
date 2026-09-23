@@ -1,4 +1,4 @@
-import { AsyncLocalStorage } from "node:async_hooks";
+import { createAsyncLocalStorage } from "./async-local.ts";
 import {
   INJECTABLE_KEY,
   CONSTRUCTOR_INJECT_KEY,
@@ -66,7 +66,8 @@ type Store = {
   parentStore?: Store;
 };
 
-const resolutionStorage = new AsyncLocalStorage<Store>();
+const resolutionStorage = createAsyncLocalStorage<Store>();
+const startedEpoch = new WeakMap<Binding, number>();
 
 function findStore(container: Container, store: Store | undefined): Store | undefined {
   for (let current = store; current; current = current.parentStore) {
@@ -408,7 +409,8 @@ export class Container {
   }
 
   private _runAsync<T>(fn: () => Promise<T>): Promise<T> {
-    if (findStore(this, resolutionStorage.getStore())) return fn();
+    const nested = resolutionStorage.inCall?.() ?? true;
+    if (nested && findStore(this, resolutionStorage.getStore())) return fn();
     const parentStore = resolutionStorage.getStore();
     if (this._syncCtx) {
       const store: Store = {
@@ -431,6 +433,24 @@ export class Container {
       throw new Error("Injektor: resolution context is missing.");
     }
     return ctx;
+  }
+
+  /**
+   * Browser fallback only. A same-turn caller is a concurrent dedupe and may
+   * wait on the in-flight promise. A later turn, while this binding is still
+   * the held frame, is the factory resuming and calling back in.
+   */
+  #throwIfBrowserReentry(binding: Binding): void {
+    const current = resolutionStorage.epoch;
+    const started = startedEpoch.get(binding);
+    if (current === undefined || started === undefined || current === started) return;
+    let store = resolutionStorage.getStore()?.parentStore;
+    while (store) {
+      if (store.container === this && frameHas(store.frame, binding)) {
+        throw new CircularDependencyError(cycleIds(store.frame, binding));
+      }
+      store = store.parentStore;
+    }
   }
 
   private _currentFrame(): Frame | undefined {
@@ -472,13 +492,14 @@ export class Container {
   private _resolveAsync<T>(
     id: ServiceIdentifier<T>,
     constraints: Constraints,
+    caller: Frame | undefined = this._currentFrame(),
   ): Promise<T> {
     const binding = this._selectBinding(id, constraints);
     if (this._isForeignSingleton(binding)) {
       const owner = this._owner(binding);
-      return owner._runAsync(() => owner._resolveBindingAsync(binding, id));
+      return owner._runAsync(() => owner._resolveBindingAsync(binding, id, owner._currentFrame()));
     }
-    return this._resolveBindingAsync(binding, id);
+    return this._resolveBindingAsync(binding, id, caller);
   }
 
   private _matchingBindings<T>(id: ServiceIdentifier<T>, constraints: Constraints): Binding<T>[] {
@@ -511,15 +532,16 @@ export class Container {
   private async _resolveAllAsync<T>(
     id: ServiceIdentifier<T>,
     constraints: Constraints,
+    caller: Frame | undefined = this._currentFrame(),
   ): Promise<T[]> {
     const bindings = this._matchingBindings(id, constraints);
     return Promise.all(
       bindings.map((binding) => {
         if (this._isForeignSingleton(binding)) {
           const owner = this._owner(binding);
-          return owner._runAsync(() => owner._resolveBindingAsync(binding, id));
+          return owner._runAsync(() => owner._resolveBindingAsync(binding, id, owner._currentFrame()));
         }
-        return this._resolveBindingAsync(binding, id);
+        return this._resolveBindingAsync(binding, id, caller);
       }),
     );
   }
@@ -560,6 +582,7 @@ export class Container {
   private _resolveBindingAsync<T>(
     binding: Binding<T>,
     id: ServiceIdentifier<T>,
+    caller: Frame | undefined = this._currentFrame(),
   ): Promise<T> {
     if (binding.type === BindingType.Constant) {
       return Promise.resolve(binding.value as T);
@@ -571,13 +594,13 @@ export class Container {
     }
 
     // Reentry of the binding now being constructed is a cycle. A sibling
-    // lookup is not on this frame, so it may share the in-flight promise.
-    const caller = this._currentFrame();
+    // lookup passes the parent frame, so it may share the in-flight promise.
     if (frameHas(caller, binding)) {
       throw new CircularDependencyError(cycleIds(caller, binding));
     }
 
     if (binding.scope === Scope.Singleton && binding.pendingPromise) {
+      this.#throwIfBrowserReentry(binding);
       return binding.pendingPromise as Promise<T>;
     }
 
@@ -585,6 +608,7 @@ export class Container {
       binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
     if (requestEntry) {
       if (requestEntry.settled) return Promise.resolve(requestEntry.value as T);
+      this.#throwIfBrowserReentry(binding);
       return requestEntry.promise as Promise<T>;
     }
 
@@ -625,6 +649,9 @@ export class Container {
     // when nobody else is waiting, without hiding it from concurrent callers.
     pending.catch(() => {});
     binding.pendingPromise = pending;
+    if (resolutionStorage.epoch !== undefined) {
+      startedEpoch.set(binding, resolutionStorage.epoch);
+    }
     try {
       const instance = await this._produceAsync(binding, id);
       binding.cache = instance;
@@ -653,6 +680,9 @@ export class Container {
     });
     pending.catch(() => {});
     ctx.requestCache.set(binding, { settled: false, promise: pending });
+    if (resolutionStorage.epoch !== undefined) {
+      startedEpoch.set(binding, resolutionStorage.epoch);
+    }
     try {
       const instance = await this._produceAsync(binding, id);
       ctx.requestCache.set(binding, { settled: true, value: instance });
@@ -705,6 +735,7 @@ export class Container {
     }
 
     const ctorArgs = (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
+    const caller = this._currentFrame();
     const args = await Promise.all(
       ctorArgs.map((arg) => {
         const desc = normalizeArg(arg);
@@ -712,9 +743,9 @@ export class Container {
           return this._resolveAllAsync(desc.token, {
             named: desc.named,
             tags: desc.tags,
-          });
+          }, caller);
         }
-        return this._resolveAsync(desc.token, { named: desc.named, tags: desc.tags });
+        return this._resolveAsync(desc.token, { named: desc.named, tags: desc.tags }, caller);
       }),
     );
 
