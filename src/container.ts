@@ -239,6 +239,8 @@ export class Container {
    * @throws {AsyncBindingError} if the binding is an async factory.
    */
   get<T>(id: ServiceIdentifier<T>): T {
+    const warm = this._warmSingleton(id);
+    if (warm) return warm.cache as T;
     return this._runSync(() => this._resolve(id, {}));
   }
 
@@ -346,6 +348,26 @@ export class Container {
       candidates = candidates.filter((b) => tagsMatch(b, tags));
     }
     return candidates;
+  }
+
+  /**
+   * Unconstrained cached singleton on this container or an ancestor.
+   * A local binding that is not a warm singleton stops the walk.
+   * The binding object is the hit, so a stored `undefined` still counts.
+   */
+  private _warmSingleton<T>(id: ServiceIdentifier<T>): Binding<T> | undefined {
+    let current: Container | undefined = this;
+    while (current) {
+      const local = current._bindings.get(id) as Binding<T>[] | undefined;
+      if (local) {
+        if (local.length !== 1) return undefined;
+        const binding = local[0]!;
+        if (binding.scope === Scope.Singleton && binding.cached) return binding;
+        return undefined;
+      }
+      current = current._parent;
+    }
+    return undefined;
   }
 
   /**
@@ -548,11 +570,11 @@ export class Container {
 
   private _resolveBindingSync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): T {
     if (binding.type === BindingType.Constant) return binding.value as T;
-
-    const ctx = this._currentCtx();
     if (binding.scope === Scope.Singleton && binding.cached) {
       return binding.cache as T;
     }
+
+    const ctx = this._currentCtx();
 
     const requestEntry =
       binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
