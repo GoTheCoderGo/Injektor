@@ -34,7 +34,7 @@
     "prepublishOnly": "( (bun x -p typescript@5.7.3 tsc --project tsconfig.build.json --declaration --emitDeclarationOnly --noEmit) || exit 1) && bun run build"
   },
 
-  "version": "1.1.0",
+  "version": "1.1.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/GoTheCoderGo/Injektor.git"
