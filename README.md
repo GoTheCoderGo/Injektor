@@ -124,6 +124,37 @@ export class Configuration {
 }
 ```
 
+## Factories and async resolution
+
+Factories receive a `ResolutionContext` with the container's `get`, `getNamed`,
+`getTagged`, `getAll`, and corresponding async methods. Use this resolver to keep
+dependency lookups in the current request graph, including after `await`:
+
+```typescript
+const REQUEST = createToken<object>("Request");
+const SERVICE = createToken<{ request: object }>("Service");
+
+container.bind(REQUEST).toFactory(() => ({})).inRequestScope();
+container.bind(SERVICE).toAsyncFactory(async (ctx) => {
+  const request = ctx.get(REQUEST);
+  await Promise.resolve();
+  // Resolves the same request-scoped instance, even in browsers.
+  const sameRequest = await ctx.getAsync(REQUEST);
+  return { request: sameRequest };
+});
+
+const service = await container.getAsync(SERVICE);
+```
+
+Existing factories that take no arguments continue to work. In browsers, use
+`ctx` for dependency lookups after `await`: calling the outer container at that
+point starts a separate resolution graph. Runtimes with native async context
+also preserve the graph for calls through the outer container.
+
+While a singleton is being initialized asynchronously, synchronous `get()`
+throws `AsyncBindingError`. Await `getAsync()` to share its pending result;
+subsequent synchronous lookups return the cached instance.
+
 ## Autobinding
 
 If you don't want to manually bind every single class, you can enable `autoBindInjectable`. The container will automatically resolve and bind any requested class decorated with `@injectable()`.

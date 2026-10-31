@@ -56,9 +56,9 @@ export interface Binding<T = unknown> {
   /** The constant value (for Constant bindings). */
   value?: T;
   /** The factory function (for Factory bindings). */
-  factory?: () => T;
+  factory?: (context: ResolutionContext) => T;
   /** The async factory function (for AsyncFactory bindings). */
-  asyncFactory?: () => Promise<T>;
+  asyncFactory?: (context: ResolutionContext) => Promise<T>;
   /**
    * Cached singleton instance.
    * Only meaningful when `cached` is true, so a stored `undefined` is a hit.
@@ -94,6 +94,22 @@ export interface InjectDescriptor<T = unknown> {
 export type InjectArg<T = unknown> = ServiceIdentifier<T> | InjectDescriptor<T>;
 
 /**
+ * A factory's resolver, bound to its current dependency graph.
+ * Use this for lookups after `await` to preserve request scope in browsers.
+ */
+export type ResolutionContext = Pick<
+  import("./container.ts").Container,
+  | "get"
+  | "getNamed"
+  | "getTagged"
+  | "getAll"
+  | "getAsync"
+  | "getNamedAsync"
+  | "getTaggedAsync"
+  | "getAllAsync"
+>;
+
+/**
  * Shape of constructor injection metadata stored on a class.
  * An ordered array of injection arguments matching the constructor parameters.
  */
@@ -101,25 +117,25 @@ export type ConstructorInjectMetadata = ReadonlyArray<InjectArg>;
 
 /**
  * Shape of property injection metadata stored on a class.
- * Maps field name → service identifier token.
+ * Maps accessor identity → service identifier token.
  */
 export type PropertyInjectMetadata = Map<string | symbol, ServiceIdentifier>;
 
 /**
  * Shape of named property injection metadata.
- * Maps field name → constraint name.
+ * Maps accessor identity → constraint name.
  */
 export type NamedInjectMetadata = Map<string | symbol, string>;
 
 /**
  * Shape of tagged property injection metadata.
- * Maps field name → tags record.
+ * Maps accessor identity → tags record.
  */
 export type TaggedInjectMetadata = Map<string | symbol, Record<string, unknown>>;
 
 /**
  * Shape of multi-inject property metadata.
- * Maps field name → service identifier token.
+ * Maps accessor identity → service identifier token.
  */
 export type MultiInjectMetadata = Map<string | symbol, ServiceIdentifier>;
 
@@ -135,7 +151,7 @@ export interface AccessorInjectInfo {
   home?: Function;
 }
 
-/** Map of field name → accessor write target. */
+/** Map of accessor identity → accessor write target. */
 export type AccessorInjectMetadata = Map<string | symbol, AccessorInjectInfo>;
 
 /**

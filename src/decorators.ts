@@ -33,31 +33,38 @@ function getOwnMap<K, V>(metadata: Record<symbol, any>, key: symbol): Map<K, V> 
   return metadata[key];
 }
 
-/**
- * Remember the accessor setter. `context.name` for a private field is the
- * string "#field", and assigning that key does not call the private setter.
- */
-function recordAccessor(context: DecoratorContext): void {
-  if (context.kind !== "accessor") return;
-  const accessor = context as DecoratorContext & {
-    static: boolean;
-    access: { set(receiver: unknown, value: unknown): void };
-    addInitializer(initializer: (this: unknown) => void): void;
-  };
+const accessorKeys = new WeakMap<object, Map<string, Map<string | symbol, symbol>>>();
+
+/** Remember the setter under an identity shared by decorators on this accessor. */
+function recordAccessor(context: ClassAccessorDecoratorContext): string | symbol {
+  // Public instance accessors retain name-based overriding. Private accessors
+  // and static accessors need an identity local to their declaring class.
+  let key = context.name;
+  if (context.private || context.static) {
+    let kinds = accessorKeys.get(context.metadata);
+    if (!kinds) accessorKeys.set(context.metadata, kinds = new Map());
+    const kind = `${context.static ? "static" : "instance"}:${context.private}`;
+    let keys = kinds.get(kind);
+    if (!keys) kinds.set(kind, keys = new Map());
+    let identity = keys.get(context.name);
+    if (!identity) keys.set(context.name, identity = Symbol(String(context.name)));
+    key = identity;
+  }
   const map = getOwnMap<string | symbol, AccessorInjectInfo>(
     context.metadata,
     ACCESSOR_INJECT_KEY,
   );
   const info: AccessorInjectInfo = {
-    set: accessor.access.set.bind(accessor.access),
-    static: accessor.static,
+    set: context.access.set,
+    static: context.static,
   };
-  if (accessor.static) {
-    accessor.addInitializer(function (this: unknown) {
+  if (context.static) {
+    context.addInitializer(function (this: unknown) {
       info.home = this as Function;
     });
   }
-  map.set(context.name, info);
+  map.set(key, info);
+  return key;
 }
 
 /**
@@ -100,9 +107,9 @@ export function injectable(options?: InjectableOptions) {
       const inherited = context.metadata[CONSTRUCTOR_INJECT_KEY] as
         | ConstructorInjectMetadata
         | undefined;
-      // A declared constructor does not forward arguments. Copy the base list
-      // only for the default constructor, which does.
-      if (!classDeclaresConstructor(ctor) && inherited && inherited.length > 0) {
+      // Default constructors, including compiler-generated forwarding
+      // constructors for decorated fields, reuse the base argument list.
+      if (inherited && inherited.length > 0 && !hasNonForwardingConstructor(ctor)) {
         context.metadata[CONSTRUCTOR_INJECT_KEY] = [...inherited];
       } else {
         context.metadata[CONSTRUCTOR_INJECT_KEY] = [];
@@ -175,12 +182,12 @@ export function inject(token: ServiceIdentifier) {
       );
     }
 
-    recordAccessor(context);
+    const key = recordAccessor(context);
     const propMap = getOwnMap<string | symbol, ServiceIdentifier>(
       context.metadata,
       PROPERTY_INJECT_KEY,
     );
-    propMap.set(context.name, token);
+    propMap.set(key, token);
   };
 }
 
@@ -207,12 +214,12 @@ export function named(name: string) {
       );
     }
 
-    recordAccessor(context);
+    const key = recordAccessor(context);
     const namedMap = getOwnMap<string | symbol, string>(
       context.metadata,
       NAMED_INJECT_KEY,
     );
-    namedMap.set(context.name, name);
+    namedMap.set(key, name);
   };
 }
 
@@ -240,13 +247,13 @@ export function tagged(key: string, value: unknown) {
       );
     }
 
-    recordAccessor(context);
+    const identity = recordAccessor(context);
     const taggedMap = getOwnMap<string | symbol, Record<string, unknown>>(
       context.metadata,
       TAGGED_INJECT_KEY,
     );
-    const existing = taggedMap.get(context.name);
-    taggedMap.set(context.name, { ...existing, [key]: value });
+    const existing = taggedMap.get(identity);
+    taggedMap.set(identity, { ...existing, [key]: value });
   };
 }
 
@@ -272,18 +279,54 @@ export function multiInject(token: ServiceIdentifier) {
       );
     }
 
-    recordAccessor(context);
+    const key = recordAccessor(context);
     const multiMap = getOwnMap<string | symbol, ServiceIdentifier>(
       context.metadata,
       MULTI_INJECT_KEY,
     );
-    multiMap.set(context.name, token);
+    multiMap.set(key, token);
   };
 }
 
-function classDeclaresConstructor(ctor: Function): boolean {
+function hasNonForwardingConstructor(ctor: Function): boolean {
   const source = stripLiteralsAndComments(Function.prototype.toString.call(ctor));
-  return /\bconstructor\s*\(/.test(stripNestedClasses(outermostClassBody(source)));
+  const body = outermostClassBody(source);
+  let brace = 0;
+  let paren = 0;
+  let bracket = 0;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (brace === 0 && paren === 0 && bracket === 0 &&
+        body.startsWith("constructor", i) && /^constructor\s*\(/.test(body.slice(i))) {
+      const prefix = body.slice(0, i);
+      // Ignore calls in field initializers and static methods named constructor.
+      if (/(?:^|[;}\n])\s*$/.test(prefix) && !/\bstatic\s*$/.test(prefix)) {
+        const open = body.indexOf("(", i);
+        const close = closingDelimiter(body, open, "(", ")");
+        const params = body.slice(open + 1, close).trim();
+        const rest = params.match(/^\.\.\.\s*([\w$]+)$/)?.[1];
+        const forwarded = params === "" ? "arguments" : rest;
+        const start = body.slice(close + 1).match(/^\s*\{\s*super\s*\(\s*\.\.\.\s*([\w$]+)\s*\)/);
+        return !forwarded || start?.[1] !== forwarded;
+      }
+    }
+    if (ch === "{") brace++;
+    else if (ch === "}") brace--;
+    else if (ch === "(") paren++;
+    else if (ch === ")") paren--;
+    else if (ch === "[") bracket++;
+    else if (ch === "]") bracket--;
+  }
+  return false;
+}
+
+function closingDelimiter(source: string, start: number, open: string, close: string): number {
+  let depth = 0;
+  for (let i = start; i < source.length; i++) {
+    if (source[i] === open) depth++;
+    else if (source[i] === close && --depth === 0) return i;
+  }
+  return source.length;
 }
 
 function stripLiteralsAndComments(source: string): string {
@@ -323,19 +366,6 @@ function outermostClassBody(source: string): string {
   const outer = ranges[ranges.length - 1];
   if (!outer) return source;
   return source.slice(outer.start, outer.end);
-}
-
-function stripNestedClasses(body: string): string {
-  const ranges = classBodyRanges(body);
-  if (ranges.length === 0) return body;
-  let out = "";
-  let cursor = 0;
-  for (const range of ranges) {
-    out += body.slice(cursor, range.classStart);
-    cursor = range.end + 1;
-  }
-  out += body.slice(cursor);
-  return out;
 }
 
 function classBodyRanges(

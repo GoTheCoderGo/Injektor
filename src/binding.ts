@@ -1,4 +1,4 @@
-import type { Constructor, ServiceIdentifier, Binding } from "./types.ts";
+import type { Constructor, ServiceIdentifier, Binding, ResolutionContext } from "./types.ts";
 import { Scope, BindingType } from "./types.ts";
 import { SCOPE_KEY } from "./consts.ts";
 import { InvalidBindingError } from "./errors.ts";
@@ -86,8 +86,9 @@ export class BindingBuilder<T> {
 
   /**
    * Bind the identifier to a synchronous factory function.
+   * The provided resolver shares the current dependency graph.
    */
-  toFactory(factory: () => T): this {
+  toFactory(factory: (context: ResolutionContext) => T): this {
     this._binding.type = BindingType.Factory;
     this._binding.factory = factory;
     this._commitOnce();
@@ -97,8 +98,9 @@ export class BindingBuilder<T> {
   /**
    * Bind the identifier to an asynchronous factory function.
    * Must be resolved via `container.getAsync()`.
+   * Use the provided resolver for dependency lookups after `await` in browsers.
    */
-  toAsyncFactory(factory: () => Promise<T>): this {
+  toAsyncFactory(factory: (context: ResolutionContext) => Promise<T>): this {
     this._binding.type = BindingType.AsyncFactory;
     this._binding.asyncFactory = factory;
     this._commitOnce();

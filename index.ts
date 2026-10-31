@@ -27,6 +27,7 @@ export type {
   InjectDescriptor,
   InjectArg,
   ContainerOptions,
+  ResolutionContext,
 } from "./src/types.ts";
 
 // ── Errors ──

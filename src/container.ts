@@ -31,6 +31,7 @@ import type {
   MultiInjectMetadata,
   AccessorInjectMetadata,
   ContainerOptions,
+  ResolutionContext as FactoryResolutionContext,
 } from "./types.ts";
 import { Scope, BindingType } from "./types.ts";
 
@@ -47,6 +48,7 @@ type RequestEntry = {
   settled: boolean;
   value?: unknown;
   promise?: Promise<unknown>;
+  frame?: Frame;
 };
 
 type ResolutionContext = {
@@ -57,6 +59,8 @@ type ResolutionContext = {
 type Frame = {
   binding: Binding;
   parent?: Frame;
+  waitingFor?: Map<Frame, number>;
+  settled?: boolean;
 };
 
 type Store = {
@@ -67,7 +71,7 @@ type Store = {
 };
 
 const resolutionStorage = createAsyncLocalStorage<Store>();
-const startedEpoch = new WeakMap<Binding, number>();
+const singletonFrames = new WeakMap<Binding, Frame>();
 
 function findStore(container: Container, store: Store | undefined): Store | undefined {
   for (let current = store; current; current = current.parentStore) {
@@ -78,7 +82,7 @@ function findStore(container: Container, store: Store | undefined): Store | unde
 
 function frameHas(frame: Frame | undefined, binding: Binding): boolean {
   for (let current = frame; current; current = current.parent) {
-    if (current.binding === binding) return true;
+    if (!current.settled && current.binding === binding) return true;
   }
   return false;
 }
@@ -90,6 +94,41 @@ function cycleIds(frame: Frame | undefined, binding: Binding): ServiceIdentifier
   for (let i = frames.length - 1; i >= 0; i--) ids.push(frames[i]!.binding.id);
   ids.push(binding.id);
   return ids;
+}
+
+/** Follow actual waits as well as ancestry: parallel branches can wait on each other. */
+function dependencyPath(from: Frame, to: Frame, seen = new Set<Frame>()): Frame[] | undefined {
+  if (from.settled || seen.has(from)) return undefined;
+  if (from === to) return [from];
+  seen.add(from);
+  for (const dependency of from.waitingFor?.keys() ?? []) {
+    const path = dependencyPath(dependency, to, seen);
+    if (path) return [from, ...path];
+  }
+  return undefined;
+}
+
+function addDependency(caller: Frame | undefined, target: Frame): () => void {
+  if (!caller || caller.settled || target.settled) return () => {};
+  const path = dependencyPath(target, caller);
+  if (path) {
+    throw new CircularDependencyError([caller, ...path].map((frame) => frame.binding.id));
+  }
+  const dependencies = caller.waitingFor ??= new Map();
+  dependencies.set(target, (dependencies.get(target) ?? 0) + 1);
+  return () => {
+    const remaining = (dependencies.get(target) ?? 1) - 1;
+    if (remaining > 0) dependencies.set(target, remaining);
+    else dependencies.delete(target);
+  };
+}
+
+function waitFor<T>(caller: Frame | undefined, target: Frame, promise: Promise<T>): Promise<T> {
+  const release = addDependency(caller, target);
+  return promise.then(
+    (value) => { release(); return value; },
+    (err) => { release(); throw err; },
+  );
 }
 
 function normalizeArg(arg: InjectArg): InjectDescriptor {
@@ -431,8 +470,7 @@ export class Container {
   }
 
   private _runAsync<T>(fn: () => Promise<T>): Promise<T> {
-    const nested = resolutionStorage.inCall?.() ?? true;
-    if (nested && findStore(this, resolutionStorage.getStore())) return fn();
+    if (findStore(this, resolutionStorage.getStore())) return fn();
     const parentStore = resolutionStorage.getStore();
     if (this._syncCtx) {
       const store: Store = {
@@ -444,7 +482,7 @@ export class Container {
       return resolutionStorage.run(store, fn);
     }
     const ctx: ResolutionContext = { requestCache: new Map() };
-    const store: Store = { container: this, ctx, frame: undefined, parentStore };
+    const store: Store = { container: this, ctx, frame: parentStore?.frame, parentStore };
     return resolutionStorage.run(store, fn);
   }
 
@@ -457,28 +495,36 @@ export class Container {
     return ctx;
   }
 
-  /**
-   * Browser fallback only. A same-turn caller is a concurrent dedupe and may
-   * wait on the in-flight promise. A later turn, while this binding is still
-   * the held frame, is the factory resuming and calling back in.
-   */
-  #throwIfBrowserReentry(binding: Binding): void {
-    const current = resolutionStorage.epoch;
-    const started = startedEpoch.get(binding);
-    if (current === undefined || started === undefined || current === started) return;
-    let store = resolutionStorage.getStore()?.parentStore;
-    while (store) {
-      if (store.container === this && frameHas(store.frame, binding)) {
-        throw new CircularDependencyError(cycleIds(store.frame, binding));
-      }
-      store = store.parentStore;
-    }
+  private _currentFrame(): Frame | undefined {
+    const current = resolutionStorage.getStore();
+    // Binding ancestry spans containers even when their request caches differ.
+    if (findStore(this, current)) return current?.frame;
+    return this._syncFrame ?? current?.frame;
   }
 
-  private _currentFrame(): Frame | undefined {
-    const found = findStore(this, resolutionStorage.getStore());
-    if (found) return found.frame;
-    return this._syncFrame;
+  private _captureStore(): Store {
+    return {
+      container: this,
+      ctx: this._currentCtx(),
+      frame: this._currentFrame(),
+      parentStore: resolutionStorage.getStore(),
+    };
+  }
+
+  /** Bind factory lookups to their graph without relying on ambient browser state. */
+  private _factoryContext(): FactoryResolutionContext {
+    const store = this._captureStore();
+    const run = <T>(fn: () => T): T => resolutionStorage.run(store, fn);
+    return {
+      get: (id) => run(() => this.get(id)),
+      getNamed: (id, name) => run(() => this.getNamed(id, name)),
+      getTagged: (id, key, value) => run(() => this.getTagged(id, key, value)),
+      getAll: (id) => run(() => this.getAll(id)),
+      getAsync: (id) => run(() => this.getAsync(id)),
+      getNamedAsync: (id, name) => run(() => this.getNamedAsync(id, name)),
+      getTaggedAsync: (id, key, value) => run(() => this.getTaggedAsync(id, key, value)),
+      getAllAsync: (id) => run(() => this.getAllAsync(id)),
+    };
   }
 
   private _withFrame<T>(frame: Frame, fn: () => T): T {
@@ -574,6 +620,13 @@ export class Container {
       return binding.cache as T;
     }
 
+    const caller = this._currentFrame();
+    if (frameHas(caller, binding)) {
+      throw new CircularDependencyError(cycleIds(caller, binding));
+    }
+    if (binding.scope === Scope.Singleton && binding.pendingPromise) {
+      throw new AsyncBindingError(id);
+    }
     const ctx = this._currentCtx();
 
     const requestEntry =
@@ -583,22 +636,21 @@ export class Container {
       return requestEntry.value as T;
     }
 
-    const caller = this._currentFrame();
-    if (frameHas(caller, binding)) {
-      throw new CircularDependencyError(cycleIds(caller, binding));
-    }
-
     const frame: Frame = { binding, parent: caller };
-    return this._withFrame(frame, () => {
-      const instance = this._produceSync(binding, id);
-      if (binding.scope === Scope.Singleton) {
-        binding.cache = instance;
-        binding.cached = true;
-      } else if (binding.scope === Scope.Request) {
-        ctx.requestCache.set(binding, { settled: true, value: instance });
-      }
-      return instance;
-    });
+    try {
+      return this._withFrame(frame, () => {
+        const instance = this._produceSync(binding, id);
+        if (binding.scope === Scope.Singleton) {
+          binding.cache = instance;
+          binding.cached = true;
+        } else if (binding.scope === Scope.Request) {
+          ctx.requestCache.set(binding, { settled: true, value: instance });
+        }
+        return instance;
+      });
+    } finally {
+      frame.settled = true;
+    }
   }
 
   private _resolveBindingAsync<T>(
@@ -622,19 +674,18 @@ export class Container {
     }
 
     if (binding.scope === Scope.Singleton && binding.pendingPromise) {
-      this.#throwIfBrowserReentry(binding);
-      return binding.pendingPromise as Promise<T>;
+      return waitFor(caller, singletonFrames.get(binding)!, binding.pendingPromise);
     }
 
     const requestEntry =
       binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
     if (requestEntry) {
       if (requestEntry.settled) return Promise.resolve(requestEntry.value as T);
-      this.#throwIfBrowserReentry(binding);
-      return requestEntry.promise as Promise<T>;
+      return waitFor(caller, requestEntry.frame!, requestEntry.promise as Promise<T>);
     }
 
     const frame: Frame = { binding, parent: caller };
+    const release = addDependency(caller, frame);
     const store: Store = {
       container: this,
       ctx,
@@ -642,15 +693,24 @@ export class Container {
       parentStore: resolutionStorage.getStore(),
     };
 
-    return resolutionStorage.run(store, async () => {
+    const promise = resolutionStorage.run(store, () => {
       if (binding.scope === Scope.Singleton) {
-        return this._resolveSingletonAsync(binding, id);
+        return this._resolveSingletonAsync(binding, id, frame);
       }
       if (binding.scope === Scope.Request) {
-        return this._resolveRequestAsync(binding, id, ctx);
+        return this._resolveRequestAsync(binding, id, ctx, frame);
       }
       return this._produceAsync(binding, id);
     });
+    const finish = () => {
+      frame.settled = true;
+      frame.waitingFor?.clear();
+      release();
+    };
+    return promise.then(
+      (value) => { finish(); return value; },
+      (err) => { finish(); throw err; },
+    );
   }
 
   /**
@@ -660,6 +720,7 @@ export class Container {
   private async _resolveSingletonAsync<T>(
     binding: Binding<T>,
     id: ServiceIdentifier<T>,
+    frame: Frame,
   ): Promise<T> {
     let settle!: (value: T) => void;
     let fail!: (err: unknown) => void;
@@ -671,9 +732,7 @@ export class Container {
     // when nobody else is waiting, without hiding it from concurrent callers.
     pending.catch(() => {});
     binding.pendingPromise = pending;
-    if (resolutionStorage.epoch !== undefined) {
-      startedEpoch.set(binding, resolutionStorage.epoch);
-    }
+    singletonFrames.set(binding, frame);
     try {
       const instance = await this._produceAsync(binding, id);
       binding.cache = instance;
@@ -685,6 +744,7 @@ export class Container {
       throw err;
     } finally {
       binding.pendingPromise = undefined;
+      singletonFrames.delete(binding);
     }
   }
 
@@ -693,6 +753,7 @@ export class Container {
     binding: Binding<T>,
     id: ServiceIdentifier<T>,
     ctx: ResolutionContext,
+    frame: Frame,
   ): Promise<T> {
     let settle!: (value: T) => void;
     let fail!: (err: unknown) => void;
@@ -701,32 +762,30 @@ export class Container {
       fail = reject;
     });
     pending.catch(() => {});
-    ctx.requestCache.set(binding, { settled: false, promise: pending });
-    if (resolutionStorage.epoch !== undefined) {
-      startedEpoch.set(binding, resolutionStorage.epoch);
-    }
+    ctx.requestCache.set(binding, { settled: false, promise: pending, frame });
     try {
       const instance = await this._produceAsync(binding, id);
       ctx.requestCache.set(binding, { settled: true, value: instance });
       settle(instance);
       return instance;
     } catch (err) {
+      ctx.requestCache.delete(binding);
       fail(err);
       throw err;
     }
   }
 
   private _produceSync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): T {
-    if (binding.type === BindingType.Factory) return binding.factory!() as T;
+    if (binding.type === BindingType.Factory) return binding.factory!(this._factoryContext());
     if (binding.type === BindingType.AsyncFactory) throw new AsyncBindingError(id);
     return this._createInstance(binding.implementationClass as Constructor<T>);
   }
 
   private async _produceAsync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): Promise<T> {
     if (binding.type === BindingType.AsyncFactory) {
-      return binding.asyncFactory!() as Promise<T>;
+      return binding.asyncFactory!(this._factoryContext());
     }
-    if (binding.type === BindingType.Factory) return binding.factory!() as T;
+    if (binding.type === BindingType.Factory) return binding.factory!(this._factoryContext());
     return this._createInstanceAsync(binding.implementationClass as Constructor<T>);
   }
 
@@ -751,6 +810,7 @@ export class Container {
   }
 
   private async _createInstanceAsync<T>(ctor: Constructor<T>): Promise<T> {
+    const store = this._captureStore();
     const metadata = ctor[Symbol.metadata] as Record<symbol, unknown> | undefined;
     if (!metadata || metadata[INJECTABLE_KEY] !== true) {
       throw new NotInjectableError(ctor);
@@ -771,8 +831,8 @@ export class Container {
       }),
     );
 
-    const instance = new ctor(...args);
-    await this._injectPropertiesAsync(instance as object, ctor, metadata);
+    const instance = resolutionStorage.run(store, () => new ctor(...args));
+    await resolutionStorage.run(store, () => this._injectPropertiesAsync(instance as object, ctor, metadata));
     return instance;
   }
 
@@ -812,6 +872,7 @@ export class Container {
     ctor: Constructor,
     metadata: Record<symbol, unknown>,
   ): Promise<void> {
+    const store = this._captureStore();
     const propMap =
       (metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata) ?? new Map();
     const namedMap =
@@ -822,19 +883,19 @@ export class Container {
       (metadata[MULTI_INJECT_KEY] as MultiInjectMetadata) ?? new Map();
 
     for (const [fieldName, token] of propMap) {
-      const value = await this._resolveAsync(token, {
+      const value = await resolutionStorage.run(store, () => this._resolveAsync(token, {
         named: namedMap.get(fieldName),
         tags: taggedMap.get(fieldName),
-      });
-      this._assign(instance, ctor, metadata, fieldName, value);
+      }));
+      resolutionStorage.run(store, () => this._assign(instance, ctor, metadata, fieldName, value));
     }
 
     for (const [fieldName, token] of multiMap) {
-      const values = await this._resolveAllAsync(token, {
+      const values = await resolutionStorage.run(store, () => this._resolveAllAsync(token, {
         named: namedMap.get(fieldName),
         tags: taggedMap.get(fieldName),
-      });
-      this._assign(instance, ctor, metadata, fieldName, values);
+      }));
+      resolutionStorage.run(store, () => this._assign(instance, ctor, metadata, fieldName, values));
     }
   }
 

@@ -78,12 +78,13 @@ export class InvalidBindingError extends Error {
 }
 
 /**
- * Thrown when an async binding is resolved synchronously with get().
+ * Thrown when a binding requires asynchronous resolution, including an
+ * unfinished singleton initialization, but is requested with get().
  */
 export class AsyncBindingError extends Error {
   constructor(id: ServiceIdentifier) {
     super(
-      `Binding for ${formatId(id)} is an async factory. Use container.getAsync() instead.`
+      `Binding for ${formatId(id)} requires asynchronous resolution. Use container.getAsync() instead.`
     );
     this.name = "AsyncBindingError";
   }

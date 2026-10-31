@@ -349,7 +349,7 @@ describe("Container", () => {
 
     it("should throw InvalidDecoratorUsageError for wrong decorator targets", () => {
       expect(() => {
-        // @ts-expect-error — deliberately wrong usage for testing
+        // Deliberately wrong usage to check runtime decorator validation.
         @inject(WEAPON)
         class Bad {}
       }).toThrow(InvalidDecoratorUsageError);
