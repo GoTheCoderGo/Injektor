@@ -1,4 +1,5 @@
 {
+  "exclude": ["dist", "tests/package"],
   "compilerOptions": {
     "outDir": "./dist",
     // Environment setup & latest features

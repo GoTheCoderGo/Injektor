@@ -26,3 +26,13 @@ export const ACCESSOR_INJECT_KEY = Symbol("injektor:accessor");
 
 /** Scope defined via @injectable() options. */
 export const SCOPE_KEY = Symbol("injektor:scope");
+
+/** Inherit injection details only after the class itself opts into DI. */
+export function getInjectableMetadata(ctor: Function): Record<symbol, unknown> | undefined {
+  if (!Object.hasOwn(ctor, Symbol.metadata)) return undefined;
+  const metadata = ctor[Symbol.metadata];
+  if (metadata && Object.hasOwn(metadata, INJECTABLE_KEY) && metadata[INJECTABLE_KEY] === true) {
+    return metadata;
+  }
+  return undefined;
+}

@@ -22,6 +22,7 @@ export type { Token } from "./src/tokens.ts";
 export { Scope, BindingType } from "./src/types.ts";
 export type {
   ServiceIdentifier,
+  BindingIdentifier,
   Constructor,
   Binding,
   InjectDescriptor,

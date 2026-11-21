@@ -155,6 +155,13 @@ While a singleton is being initialized asynchronously, synchronous `get()`
 throws `AsyncBindingError`. Await `getAsync()` to share its pending result;
 subsequent synchronous lookups return the cached instance.
 
+If a synchronous factory returns a promise as the service value, `get()`
+and dependency injection preserve that promise. Awaiting `getAsync()`
+returns its fulfillment value.
+
+`ContainerModule` registries run synchronously during `load()`. Register
+an async factory inside the registry for services that need asynchronous setup.
+
 ## Autobinding
 
 If you don't want to manually bind every single class, you can enable `autoBindInjectable`. The container will automatically resolve and bind any requested class decorated with `@injectable()`.
@@ -184,4 +191,5 @@ const sword = container.get(AutoSword);
 
 ```bash
 bun test
+bun run test:package
 ```

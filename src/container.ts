@@ -1,6 +1,6 @@
 import { createAsyncLocalStorage } from "./async-local.ts";
 import {
-  INJECTABLE_KEY,
+  getInjectableMetadata,
   CONSTRUCTOR_INJECT_KEY,
   PROPERTY_INJECT_KEY,
   NAMED_INJECT_KEY,
@@ -20,6 +20,7 @@ import { BindingBuilder } from "./binding.ts";
 import { ContainerModule } from "./module.ts";
 import type {
   Constructor,
+  BindingIdentifier,
   ServiceIdentifier,
   Binding,
   InjectArg,
@@ -44,15 +45,19 @@ type Constraints = {
   tags?: Record<string, unknown>;
 };
 
+/** A service may itself be a promise. Keep it intact until a public single lookup returns. */
+type Resolved<T> = { value: T };
+
 type RequestEntry = {
   settled: boolean;
   value?: unknown;
-  promise?: Promise<unknown>;
+  promise?: Promise<Resolved<unknown>>;
   frame?: Frame;
 };
 
 type ResolutionContext = {
   requestCache: Map<Binding, RequestEntry>;
+  ownerContexts?: Map<Container, ResolutionContext>;
 };
 
 /** One binding activation. Reentering the same object is a cycle; a different binding for the same token is not. */
@@ -71,7 +76,7 @@ type Store = {
 };
 
 const resolutionStorage = createAsyncLocalStorage<Store>();
-const singletonFrames = new WeakMap<Binding, Frame>();
+const pendingSingletons = new WeakMap<Binding, { frame: Frame; ready: Promise<Resolved<unknown>> }>();
 
 function findStore(container: Container, store: Store | undefined): Store | undefined {
   for (let current = store; current; current = current.parentStore) {
@@ -146,7 +151,7 @@ function normalizeArg(arg: InjectArg): InjectDescriptor {
 function tagsMatch(binding: Binding, requiredTags: Record<string, unknown>): boolean {
   if (!binding.tags) return false;
   for (const [key, value] of Object.entries(requiredTags)) {
-    if (binding.tags[key] !== value) return false;
+    if (!Object.hasOwn(binding.tags, key) || binding.tags[key] !== value) return false;
   }
   return true;
 }
@@ -197,10 +202,12 @@ export class Container {
    * Start configuring a binding for the given service identifier.
    * Returns a fluent `BindingBuilder`.
    */
-  bind<T>(id: ServiceIdentifier<T>): BindingBuilder<T> {
-    return new BindingBuilder<T>(id, (binding) => {
-      this._addBinding(binding as Binding);
-    });
+  bind<T>(id: BindingIdentifier<T>): BindingBuilder<T> {
+    return new BindingBuilder<T>(
+      id,
+      (binding) => this._addBinding(binding),
+      (previous, next) => this._replaceBinding(previous, next),
+    );
   }
 
   /**
@@ -213,7 +220,7 @@ export class Container {
   /**
    * Remove all existing bindings for the identifier and return a new `BindingBuilder`.
    */
-  rebind<T>(id: ServiceIdentifier<T>): BindingBuilder<T> {
+  rebind<T>(id: BindingIdentifier<T>): BindingBuilder<T> {
     this.unbind(id);
     return this.bind(id);
   }
@@ -239,20 +246,41 @@ export class Container {
     }
 
     const registered: Binding[] = [];
-    const bindFn = <T>(id: ServiceIdentifier<T>): BindingBuilder<T> => {
+    this._moduleBindings.set(module, registered);
+    let open = true;
+    const assertRegistering = () => {
+      if (!open || this._moduleBindings.get(module) !== registered) {
+        throw new InvalidBindingError("Container module registration is closed.");
+      }
+    };
+    const bindFn = <T>(id: BindingIdentifier<T>): BindingBuilder<T> => {
+      assertRegistering();
       return new BindingBuilder<T>(id, (binding) => {
-        registered.push(binding as Binding);
-        this._addBinding(binding as Binding);
+        assertRegistering();
+        registered.push(binding);
+        this._addBinding(binding);
+      }, (previous, next) => {
+        const index = registered.indexOf(previous);
+        if (index !== -1 && this._moduleBindings.get(module) === registered) {
+          registered[index] = next;
+          this._replaceBinding(previous, next);
+        }
       });
     };
 
     try {
-      module.registry(bindFn);
+      const result: unknown = module.registry(bindFn);
+      if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+        // Observe the continuation, including attempts to use the closed registry.
+        Promise.resolve(result).catch(() => {});
+        throw new InvalidBindingError("Container module registries must be synchronous.");
+      }
     } catch (err) {
-      for (const binding of registered) this._removeBinding(binding);
+      if (this._moduleBindings.get(module) === registered) this.unload(module);
       throw err;
+    } finally {
+      open = false;
     }
-    this._moduleBindings.set(module, registered);
   }
 
   /**
@@ -309,15 +337,17 @@ export class Container {
    * Asynchronously resolve a dependency. Required for `AsyncFactory` bindings.
    * Also works with sync bindings (returns an immediately-resolved promise).
    */
-  async getAsync<T>(id: ServiceIdentifier<T>): Promise<T> {
-    return this._runAsync(() => this._resolveAsync(id, {}));
+  async getAsync<T>(id: ServiceIdentifier<T>): Promise<Awaited<T>> {
+    const result = await this._runAsync(() => this._resolveAsync(id, {}));
+    return await result.value;
   }
 
   /**
    * Asynchronously resolve a dependency by service identifier + named constraint.
    */
-  async getNamedAsync<T>(id: ServiceIdentifier<T>, name: string): Promise<T> {
-    return this._runAsync(() => this._resolveAsync(id, { named: name }));
+  async getNamedAsync<T>(id: ServiceIdentifier<T>, name: string): Promise<Awaited<T>> {
+    const result = await this._runAsync(() => this._resolveAsync(id, { named: name }));
+    return await result.value;
   }
 
   /**
@@ -327,10 +357,9 @@ export class Container {
     id: ServiceIdentifier<T>,
     key: string,
     value: unknown,
-  ): Promise<T> {
-    return this._runAsync(() =>
-      this._resolveAsync(id, { tags: { [key]: value } }),
-    );
+  ): Promise<Awaited<T>> {
+    const result = await this._runAsync(() => this._resolveAsync(id, { tags: { [key]: value } }));
+    return await result.value;
   }
 
   /**
@@ -350,6 +379,13 @@ export class Container {
     }
   }
 
+  private _replaceBinding(previous: Binding, next: Binding): void {
+    const list = this._bindings.get(previous.id);
+    if (!list) return;
+    const index = list.indexOf(previous);
+    if (index !== -1) list[index] = next;
+  }
+
   private _removeBinding(binding: Binding): void {
     const list = this._bindings.get(binding.id);
     if (!list) return;
@@ -366,10 +402,7 @@ export class Container {
 
   private _tryAutoBind(id: ServiceIdentifier): Binding | undefined {
     if (!this._autoBindInjectable || typeof id !== "function") return undefined;
-    const metadata = (id as Constructor)[Symbol.metadata] as
-      | Record<symbol, unknown>
-      | undefined;
-    if (!metadata || metadata[INJECTABLE_KEY] !== true) return undefined;
+    if (!getInjectableMetadata(id)) return undefined;
     const before = this._bindings.get(id)?.length ?? 0;
     this.bind(id as Constructor).toSelf();
     const list = this._bindings.get(id);
@@ -455,6 +488,20 @@ export class Container {
   /** Singletons are built by the container that registered them, so a child cannot publish its own instance into the shared binding. */
   private _isForeignSingleton(binding: Binding): boolean {
     return binding.scope === Scope.Singleton && !this._owns(binding);
+  }
+
+  /** Delegate lookup to the owner, retaining its request cache for this graph. */
+  private _withOwner<T>(binding: Binding, resolve: (owner: Container) => T): T {
+    const owner = this._owner(binding);
+    const parentStore = this._captureStore();
+    const contexts = parentStore.ctx.ownerContexts ??= new Map();
+    let ctx = findStore(owner, parentStore)?.ctx ?? owner._syncCtx ?? contexts.get(owner);
+    if (!ctx) {
+      ctx = { requestCache: new Map(), ownerContexts: contexts };
+      contexts.set(owner, ctx);
+    }
+    const store = { container: owner, ctx, frame: parentStore.frame, parentStore };
+    return resolutionStorage.run(store, () => resolve(owner));
   }
 
   private _runSync<T>(fn: () => T): T {
@@ -551,8 +598,7 @@ export class Container {
   private _resolve<T>(id: ServiceIdentifier<T>, constraints: Constraints): T {
     const binding = this._selectBinding(id, constraints);
     if (this._isForeignSingleton(binding)) {
-      const owner = this._owner(binding);
-      return owner._runSync(() => owner._resolveBindingSync(binding, id));
+      return this._withOwner(binding, (owner) => owner._resolveBindingSync(binding, id));
     }
     return this._resolveBindingSync(binding, id);
   }
@@ -561,27 +607,17 @@ export class Container {
     id: ServiceIdentifier<T>,
     constraints: Constraints,
     caller: Frame | undefined = this._currentFrame(),
-  ): Promise<T> {
+  ): Promise<Resolved<T>> {
     const binding = this._selectBinding(id, constraints);
     if (this._isForeignSingleton(binding)) {
-      const owner = this._owner(binding);
-      return owner._runAsync(() => owner._resolveBindingAsync(binding, id, owner._currentFrame()));
+      return this._withOwner(binding, (owner) => owner._resolveBindingAsync(binding, id, caller));
     }
     return this._resolveBindingAsync(binding, id, caller);
   }
 
   private _matchingBindings<T>(id: ServiceIdentifier<T>, constraints: Constraints): Binding<T>[] {
-    let all = this._lookupAll(id) as Binding<T>[];
-    if (all.length === 0) {
-      const created = this._tryAutoBind(id) as Binding<T> | undefined;
-      all = this._lookupAll(id) as Binding<T>[];
-      const matched = this._filterBindings(all, constraints);
-      if (matched.length === 0) {
-        if (created) this._removeBinding(created);
-        throw new ServiceNotFoundError(id);
-      }
-      return matched;
-    }
+    const all = this._lookupAll(id) as Binding<T>[];
+    if (all.length === 0) return [this._selectBinding(id, constraints)];
     const matched = this._filterBindings(all, constraints);
     if (matched.length === 0) throw new ServiceNotFoundError(id);
     return matched;
@@ -590,8 +626,7 @@ export class Container {
   private _resolveAll<T>(id: ServiceIdentifier<T>, constraints: Constraints): T[] {
     return this._matchingBindings(id, constraints).map((binding) => {
       if (this._isForeignSingleton(binding)) {
-        const owner = this._owner(binding);
-        return owner._runSync(() => owner._resolveBindingSync(binding, id));
+        return this._withOwner(binding, (owner) => owner._resolveBindingSync(binding, id));
       }
       return this._resolveBindingSync(binding, id);
     });
@@ -603,15 +638,15 @@ export class Container {
     caller: Frame | undefined = this._currentFrame(),
   ): Promise<T[]> {
     const bindings = this._matchingBindings(id, constraints);
-    return Promise.all(
-      bindings.map((binding) => {
+    const results = await Promise.all(
+      bindings.map(async (binding) => {
         if (this._isForeignSingleton(binding)) {
-          const owner = this._owner(binding);
-          return owner._runAsync(() => owner._resolveBindingAsync(binding, id, owner._currentFrame()));
+          return this._withOwner(binding, (owner) => owner._resolveBindingAsync(binding, id, caller));
         }
         return this._resolveBindingAsync(binding, id, caller);
       }),
     );
+    return results.map(result => result.value);
   }
 
   private _resolveBindingSync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): T {
@@ -657,14 +692,14 @@ export class Container {
     binding: Binding<T>,
     id: ServiceIdentifier<T>,
     caller: Frame | undefined = this._currentFrame(),
-  ): Promise<T> {
+  ): Promise<Resolved<T>> {
     if (binding.type === BindingType.Constant) {
-      return Promise.resolve(binding.value as T);
+      return Promise.resolve({ value: binding.value as T });
     }
 
     const ctx = this._currentCtx();
     if (binding.scope === Scope.Singleton && binding.cached) {
-      return Promise.resolve(binding.cache as T);
+      return Promise.resolve({ value: binding.cache as T });
     }
 
     // Reentry of the binding now being constructed is a cycle. A sibling
@@ -674,14 +709,15 @@ export class Container {
     }
 
     if (binding.scope === Scope.Singleton && binding.pendingPromise) {
-      return waitFor(caller, singletonFrames.get(binding)!, binding.pendingPromise);
+      const pending = pendingSingletons.get(binding)!;
+      return waitFor(caller, pending.frame, pending.ready as Promise<Resolved<T>>);
     }
 
     const requestEntry =
       binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
     if (requestEntry) {
-      if (requestEntry.settled) return Promise.resolve(requestEntry.value as T);
-      return waitFor(caller, requestEntry.frame!, requestEntry.promise as Promise<T>);
+      if (requestEntry.settled) return Promise.resolve({ value: requestEntry.value as T });
+      return waitFor(caller, requestEntry.frame!, requestEntry.promise as Promise<Resolved<T>>);
     }
 
     const frame: Frame = { binding, parent: caller };
@@ -695,12 +731,12 @@ export class Container {
 
     const promise = resolutionStorage.run(store, () => {
       if (binding.scope === Scope.Singleton) {
-        return this._resolveSingletonAsync(binding, id, frame);
+        return this._resolveSingletonAsync(binding, frame);
       }
       if (binding.scope === Scope.Request) {
-        return this._resolveRequestAsync(binding, id, ctx, frame);
+        return this._resolveRequestAsync(binding, ctx, frame);
       }
-      return this._produceAsync(binding, id);
+      return this._produceAsync(binding);
     });
     const finish = () => {
       frame.settled = true;
@@ -719,55 +755,53 @@ export class Container {
    */
   private async _resolveSingletonAsync<T>(
     binding: Binding<T>,
-    id: ServiceIdentifier<T>,
     frame: Frame,
-  ): Promise<T> {
-    let settle!: (value: T) => void;
+  ): Promise<Resolved<T>> {
+    let settle!: (result: Resolved<T>) => void;
     let fail!: (err: unknown) => void;
-    const pending = new Promise<T>((resolve, reject) => {
+    const pending = new Promise<Resolved<T>>((resolve, reject) => {
       settle = resolve;
       fail = reject;
     });
     // The caller awaits this method, not `pending`. Mark the rejection handled
     // when nobody else is waiting, without hiding it from concurrent callers.
-    pending.catch(() => {});
-    binding.pendingPromise = pending;
-    singletonFrames.set(binding, frame);
+    binding.pendingPromise = pending.then(result => result.value);
+    binding.pendingPromise.catch(() => {});
+    pendingSingletons.set(binding, { frame, ready: pending });
     try {
-      const instance = await this._produceAsync(binding, id);
-      binding.cache = instance;
+      const result = await this._produceAsync(binding);
+      binding.cache = result.value;
       binding.cached = true;
-      settle(instance);
-      return instance;
+      settle(result);
+      return result;
     } catch (err) {
       fail(err);
       throw err;
     } finally {
       binding.pendingPromise = undefined;
-      singletonFrames.delete(binding);
+      pendingSingletons.delete(binding);
     }
   }
 
   /** Reserve the request entry before awaiting so concurrent deps in one graph share one instance. */
   private async _resolveRequestAsync<T>(
     binding: Binding<T>,
-    id: ServiceIdentifier<T>,
     ctx: ResolutionContext,
     frame: Frame,
-  ): Promise<T> {
-    let settle!: (value: T) => void;
+  ): Promise<Resolved<T>> {
+    let settle!: (result: Resolved<T>) => void;
     let fail!: (err: unknown) => void;
-    const pending = new Promise<T>((resolve, reject) => {
+    const pending = new Promise<Resolved<T>>((resolve, reject) => {
       settle = resolve;
       fail = reject;
     });
     pending.catch(() => {});
     ctx.requestCache.set(binding, { settled: false, promise: pending, frame });
     try {
-      const instance = await this._produceAsync(binding, id);
-      ctx.requestCache.set(binding, { settled: true, value: instance });
-      settle(instance);
-      return instance;
+      const result = await this._produceAsync(binding);
+      ctx.requestCache.set(binding, { settled: true, value: result.value });
+      settle(result);
+      return result;
     } catch (err) {
       ctx.requestCache.delete(binding);
       fail(err);
@@ -781,17 +815,17 @@ export class Container {
     return this._createInstance(binding.implementationClass as Constructor<T>);
   }
 
-  private async _produceAsync<T>(binding: Binding<T>, id: ServiceIdentifier<T>): Promise<T> {
+  private async _produceAsync<T>(binding: Binding<T>): Promise<Resolved<T>> {
     if (binding.type === BindingType.AsyncFactory) {
-      return binding.asyncFactory!(this._factoryContext());
+      return { value: await binding.asyncFactory!(this._factoryContext()) };
     }
-    if (binding.type === BindingType.Factory) return binding.factory!(this._factoryContext());
+    if (binding.type === BindingType.Factory) return { value: binding.factory!(this._factoryContext()) };
     return this._createInstanceAsync(binding.implementationClass as Constructor<T>);
   }
 
   private _createInstance<T>(ctor: Constructor<T>): T {
-    const metadata = ctor[Symbol.metadata] as Record<symbol, unknown> | undefined;
-    if (!metadata || metadata[INJECTABLE_KEY] !== true) {
+    const metadata = getInjectableMetadata(ctor);
+    if (!metadata) {
       throw new NotInjectableError(ctor);
     }
 
@@ -809,31 +843,30 @@ export class Container {
     return instance;
   }
 
-  private async _createInstanceAsync<T>(ctor: Constructor<T>): Promise<T> {
+  private async _createInstanceAsync<T>(ctor: Constructor<T>): Promise<Resolved<T>> {
     const store = this._captureStore();
-    const metadata = ctor[Symbol.metadata] as Record<symbol, unknown> | undefined;
-    if (!metadata || metadata[INJECTABLE_KEY] !== true) {
+    const metadata = getInjectableMetadata(ctor);
+    if (!metadata) {
       throw new NotInjectableError(ctor);
     }
 
     const ctorArgs = (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
     const caller = this._currentFrame();
-    const args = await Promise.all(
-      ctorArgs.map((arg) => {
+    const dependencies = await Promise.all(
+      ctorArgs.map(async (arg) => {
         const desc = normalizeArg(arg);
         if (desc.multi) {
-          return this._resolveAllAsync(desc.token, {
-            named: desc.named,
-            tags: desc.tags,
-          }, caller);
+          const value = await this._resolveAllAsync(desc.token, { named: desc.named, tags: desc.tags }, caller);
+          return { value };
         }
         return this._resolveAsync(desc.token, { named: desc.named, tags: desc.tags }, caller);
       }),
     );
 
+    const args = dependencies.map(result => result.value);
     const instance = resolutionStorage.run(store, () => new ctor(...args));
     await resolutionStorage.run(store, () => this._injectPropertiesAsync(instance as object, ctor, metadata));
-    return instance;
+    return { value: instance };
   }
 
   private _injectProperties(
@@ -883,7 +916,7 @@ export class Container {
       (metadata[MULTI_INJECT_KEY] as MultiInjectMetadata) ?? new Map();
 
     for (const [fieldName, token] of propMap) {
-      const value = await resolutionStorage.run(store, () => this._resolveAsync(token, {
+      const { value } = await resolutionStorage.run(store, () => this._resolveAsync(token, {
         named: namedMap.get(fieldName),
         tags: taggedMap.get(fieldName),
       }));

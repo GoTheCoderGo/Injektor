@@ -1,7 +1,9 @@
 import type { Constructor, ServiceIdentifier, Binding, ResolutionContext } from "./types.ts";
 import { Scope, BindingType } from "./types.ts";
-import { SCOPE_KEY } from "./consts.ts";
+import { getInjectableMetadata, SCOPE_KEY } from "./consts.ts";
 import { InvalidBindingError } from "./errors.ts";
+
+type BindingTarget<T> = Pick<Binding<T>, "type" | "implementationClass" | "value" | "factory" | "asyncFactory">;
 
 /**
  * Fluent API builder for configuring a binding.
@@ -19,7 +21,7 @@ import { InvalidBindingError } from "./errors.ts";
  * ```
  */
 export class BindingBuilder<T> {
-  private readonly _binding: Binding<T>;
+  private _binding: Binding<T>;
   private _committed = false;
   /** Set when the caller picks a scope, so a later `to()` does not replace it. */
   private _scopeExplicit = false;
@@ -27,6 +29,7 @@ export class BindingBuilder<T> {
   constructor(
     id: ServiceIdentifier<T>,
     private readonly _onComplete: (binding: Binding<T>) => void,
+    private readonly _onReplace?: (previous: Binding<T>, next: Binding<T>) => void,
   ) {
     this._binding = {
       id,
@@ -41,23 +44,9 @@ export class BindingBuilder<T> {
    * Bind the identifier to a concrete implementation class.
    */
   to(impl: Constructor<T>): this {
-    this._binding.type = BindingType.Instance;
-    this._binding.implementationClass = impl;
-
-    if (!this._scopeExplicit) {
-      const metadata = (impl as any)[Symbol.metadata];
-      // Own property only: a subclass metadata object prototypes to the base,
-      // and inheriting the base scope is not a scope the subclass declared.
-      if (
-        metadata &&
-        Object.prototype.hasOwnProperty.call(metadata, SCOPE_KEY)
-      ) {
-        this._binding.scope = metadata[SCOPE_KEY] as Scope;
-      }
-    }
-
-    this._commitOnce();
-    return this;
+    const metadata = this._scopeExplicit ? undefined : getInjectableMetadata(impl);
+    const scope = metadata && Object.hasOwn(metadata, SCOPE_KEY) ? metadata[SCOPE_KEY] as Scope : undefined;
+    return this._setTarget({ type: BindingType.Instance, implementationClass: impl }, scope);
   }
 
   /**
@@ -77,11 +66,7 @@ export class BindingBuilder<T> {
    * Bind the identifier to a constant value. Always singleton-scoped.
    */
   toConstant(value: T): this {
-    this._binding.type = BindingType.Constant;
-    this._binding.scope = Scope.Singleton;
-    this._binding.value = value;
-    this._commitOnce();
-    return this;
+    return this._setTarget({ type: BindingType.Constant, value }, Scope.Singleton);
   }
 
   /**
@@ -89,10 +74,7 @@ export class BindingBuilder<T> {
    * The provided resolver shares the current dependency graph.
    */
   toFactory(factory: (context: ResolutionContext) => T): this {
-    this._binding.type = BindingType.Factory;
-    this._binding.factory = factory;
-    this._commitOnce();
-    return this;
+    return this._setTarget({ type: BindingType.Factory, factory });
   }
 
   /**
@@ -101,10 +83,7 @@ export class BindingBuilder<T> {
    * Use the provided resolver for dependency lookups after `await` in browsers.
    */
   toAsyncFactory(factory: (context: ResolutionContext) => Promise<T>): this {
-    this._binding.type = BindingType.AsyncFactory;
-    this._binding.asyncFactory = factory;
-    this._commitOnce();
-    return this;
+    return this._setTarget({ type: BindingType.AsyncFactory, asyncFactory: factory });
   }
 
   // ─────────────────────── Scope methods ────────────────────────
@@ -155,22 +134,36 @@ export class BindingBuilder<T> {
    * Resolve via `container.getTagged()` or `@tagged()` decorator.
    */
   whenTagged(key: string, value: unknown): this {
-    this._binding.tags ??= {};
-    this._binding.tags[key] = value;
+    const tags: Record<string, unknown> = this._binding.tags ??= Object.create(null);
+    tags[key] = value;
     return this;
   }
 
   // ─────────────────────── Internal ─────────────────────────────
 
-  /**
-   * Register the binding with the container exactly once.
-   * Subsequent mutations (scope, name, tags) act on the same binding
-   * object by reference — no re-registration needed.
-   */
-  private _commitOnce(): void {
+  /** Publish a complete target. Old resolutions keep their original binding and cache. */
+  private _setTarget(target: BindingTarget<T>, scope = this._binding.scope): this {
+    const previous = this._binding;
+    const { id, name, tags } = previous;
+    const next: Binding<T> = { id, scope, name, tags, ...target };
     if (!this._committed) {
-      this._onComplete(this._binding);
+      this._binding = next;
+      this._onComplete(next);
       this._committed = true;
+    } else if (this._onReplace) {
+      this._onReplace(previous, next);
+      this._binding = next;
+    } else {
+      // A standalone builder's one-argument callback retains the original object.
+      delete previous.implementationClass;
+      delete previous.value;
+      delete previous.factory;
+      delete previous.asyncFactory;
+      delete previous.cache;
+      delete previous.cached;
+      delete previous.pendingPromise;
+      Object.assign(previous, next);
     }
+    return this;
   }
 }

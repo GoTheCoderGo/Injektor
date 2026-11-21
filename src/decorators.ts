@@ -187,6 +187,7 @@ export function inject(token: ServiceIdentifier) {
       context.metadata,
       PROPERTY_INJECT_KEY,
     );
+    getOwnMap(context.metadata, MULTI_INJECT_KEY).delete(key);
     propMap.set(key, token);
   };
 }
@@ -284,6 +285,7 @@ export function multiInject(token: ServiceIdentifier) {
       context.metadata,
       MULTI_INJECT_KEY,
     );
+    getOwnMap(context.metadata, PROPERTY_INJECT_KEY).delete(key);
     multiMap.set(key, token);
   };
 }
@@ -346,6 +348,14 @@ function stripLiteralsAndComments(source: string): string {
       out += " ";
       continue;
     }
+    if (ch === "/" && canStartRegex(out)) {
+      const end = regexLiteralEnd(source, i);
+      if (end !== undefined) {
+        i = end;
+        out += "0";
+        continue;
+      }
+    }
     if (ch === "'" || ch === '"' || ch === "`") {
       const quote = ch;
       i++;
@@ -359,6 +369,45 @@ function stripLiteralsAndComments(source: string): string {
     out += ch;
   }
   return out;
+}
+
+/** A slash following an operand is division. Literals and comments are already masked. */
+function canStartRegex(prefix: string): boolean {
+  const before = prefix.trimEnd();
+  if (before.endsWith("++") || before.endsWith("--")) return false;
+  if (before.endsWith(")")) {
+    const preceding = beforeDelimiter(before, "(", ")");
+    return /(?:^|[^\w$.])(?:if|while|for|with)\s*$/.test(preceding);
+  }
+  if (before.endsWith("}")) {
+    const preceding = beforeDelimiter(before, "{", "}").trimEnd();
+    return /(?:[;{}):]|\b(?:else|try|finally|do))$/.test(preceding);
+  }
+  return !before || /[=({\[!,:;?&|+*%^~<>\/-]$/.test(before) ||
+    /\b(?:return|throw|case|yield|await|void|typeof|delete|instanceof|in|of|else|do)$/.test(before);
+}
+
+/** Return the text before the opening delimiter matching the final character. */
+function beforeDelimiter(source: string, open: string, close: string): string {
+  let depth = 1;
+  for (let i = source.length - 2; i >= 0; i--) {
+    if (source[i] === close) depth++;
+    if (source[i] === open && --depth === 0) return source.slice(0, i);
+  }
+  return "";
+}
+
+function regexLiteralEnd(source: string, start: number): number | undefined {
+  let inClass = false;
+  for (let i = start + 1; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\n" || ch === "\r") return undefined;
+    if (ch === "\\") i++;
+    else if (ch === "[") inClass = true;
+    else if (ch === "]") inClass = false;
+    else if (ch === "/" && !inClass) return i;
+  }
+  return undefined;
 }
 
 function outermostClassBody(source: string): string {

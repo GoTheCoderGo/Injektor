@@ -1,4 +1,4 @@
-import type { Token } from "./tokens.ts";
+import type { RawSymbol, Token, TokenValue } from "./tokens.ts";
 
 /**
  * A constructable class type.
@@ -11,9 +11,12 @@ export type Constructor<T = unknown> = new (...args: any[]) => T;
  */
 export type ServiceIdentifier<T = unknown> =
   | string
-  | symbol
+  | RawSymbol
   | Constructor<T>
-  | Token<T>;
+  | TokenValue<T>;
+
+/** Registration both accepts and produces T, so a branded token must match in both directions. */
+export type BindingIdentifier<T> = string | RawSymbol | Constructor<T> | Token<T>;
 
 /**
  * Lifecycle scope for a binding.

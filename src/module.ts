@@ -1,13 +1,14 @@
-import type { ServiceIdentifier } from "./types.ts";
+import type { BindingIdentifier } from "./types.ts";
 import type { BindingBuilder } from "./binding.ts";
 
 /**
  * The function signature provided to a ContainerModule's registry callback.
  */
-export type BindFunction = <T>(id: ServiceIdentifier<T>) => BindingBuilder<T>;
+export type BindFunction = <T>(id: BindingIdentifier<T>) => BindingBuilder<T>;
 
 /**
  * Groups related bindings into a reusable module.
+ * The registry runs synchronously. Register async factories for asynchronous initialization.
  * Load into a container with `container.load(module)`.
  *
  * @example
