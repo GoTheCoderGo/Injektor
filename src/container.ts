@@ -45,6 +45,8 @@ type Constraints = {
   tags?: Record<string, unknown>;
 };
 
+const unconstrained: Constraints = {};
+
 /** A service may itself be a promise. Keep it intact until a public single lookup returns. */
 type Resolved<T> = { value: T };
 
@@ -56,7 +58,7 @@ type RequestEntry = {
 };
 
 type ResolutionContext = {
-  requestCache: Map<Binding, RequestEntry>;
+  requestCache?: Map<Binding, RequestEntry>;
   ownerContexts?: Map<Container, ResolutionContext>;
 };
 
@@ -66,6 +68,12 @@ type Frame = {
   parent?: Frame;
   waitingFor?: Map<Frame, number>;
   settled?: boolean;
+};
+
+/** Only bindings registered by a module need a back-reference for unbind and retarget. */
+type RegisteredBinding = Binding & {
+  moduleBindings?: RegisteredBinding[];
+  moduleIndex?: number;
 };
 
 type Store = {
@@ -115,9 +123,9 @@ function dependencyPath(from: Frame, to: Frame, seen = new Set<Frame>()): Frame[
 
 function addDependency(caller: Frame | undefined, target: Frame): () => void {
   if (!caller || caller.settled || target.settled) return () => {};
-  const path = dependencyPath(target, caller);
-  if (path) {
-    throw new CircularDependencyError([caller, ...path].map((frame) => frame.binding.id));
+  if (caller === target || target.waitingFor?.size) {
+    const path = dependencyPath(target, caller);
+    if (path) throw new CircularDependencyError([caller, ...path].map(frame => frame.binding.id));
   }
   const dependencies = caller.waitingFor ??= new Map();
   dependencies.set(target, (dependencies.get(target) ?? 0) + 1);
@@ -136,16 +144,13 @@ function waitFor<T>(caller: Frame | undefined, target: Frame, promise: Promise<T
   );
 }
 
-function normalizeArg(arg: InjectArg): InjectDescriptor {
-  if (
-    typeof arg === "object" &&
-    arg !== null &&
-    !Array.isArray(arg) &&
-    "token" in arg
-  ) {
-    return arg as InjectDescriptor;
-  }
-  return { token: arg as ServiceIdentifier };
+function hasInjectedProperties(metadata: Record<symbol, unknown>): boolean {
+  return !!((metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata | undefined)?.size ||
+    (metadata[MULTI_INJECT_KEY] as MultiInjectMetadata | undefined)?.size);
+}
+
+function isDescriptor(arg: InjectArg): arg is InjectDescriptor {
+  return typeof arg === "object" && arg !== null && !Array.isArray(arg) && "token" in arg;
 }
 
 function tagsMatch(binding: Binding, requiredTags: Record<string, unknown>): boolean {
@@ -178,10 +183,10 @@ function tagsMatch(binding: Binding, requiredTags: Record<string, unknown>): boo
  */
 export class Container {
   /** Multi-binding storage: each token maps to an array of bindings. */
-  private _bindings = new Map<ServiceIdentifier, Binding[]>();
+  private _bindings = new Map<ServiceIdentifier, RegisteredBinding[]>();
 
-  /** Tracks which bindings were added by each ContainerModule. */
-  private _moduleBindings = new Map<ContainerModule, Binding[]>();
+  /** Live registrations owned by each loaded module. */
+  private _moduleBindings?: Map<ContainerModule, RegisteredBinding[]>;
 
   /** Optional parent container for hierarchical resolution. */
   private _parent?: Container;
@@ -214,6 +219,19 @@ export class Container {
    * Remove all bindings for the given service identifier.
    */
   unbind(id: ServiceIdentifier): void {
+    if (this._moduleBindings) {
+      for (const binding of this._bindings.get(id) ?? []) {
+        const registered = binding.moduleBindings;
+        if (!registered) continue;
+        // Unload order is private. Fill the vacated slot in constant time.
+        const last = registered.pop()!;
+        if (last !== binding) {
+          last.moduleIndex = binding.moduleIndex;
+          registered[last.moduleIndex!] = last;
+        }
+        binding.moduleBindings = undefined;
+      }
+    }
     this._bindings.delete(id);
   }
 
@@ -230,7 +248,7 @@ export class Container {
    * Checks this container and its parent chain.
    */
   isBound(id: ServiceIdentifier): boolean {
-    if (this._bindings.has(id) && this._bindings.get(id)!.length > 0) {
+    if (this._bindings.has(id)) {
       return true;
     }
     return this._parent?.isBound(id) ?? false;
@@ -241,15 +259,16 @@ export class Container {
    * Bindings added by the module can later be removed with `unload()`.
    */
   load(module: ContainerModule): void {
-    if (this._moduleBindings.has(module)) {
+    const loaded = this._moduleBindings ??= new Map();
+    if (loaded.has(module)) {
       throw new InvalidBindingError("Container module is already loaded.");
     }
 
-    const registered: Binding[] = [];
-    this._moduleBindings.set(module, registered);
+    const registered: RegisteredBinding[] = [];
+    loaded.set(module, registered);
     let open = true;
     const assertRegistering = () => {
-      if (!open || this._moduleBindings.get(module) !== registered) {
+      if (!open || loaded.get(module) !== registered) {
         throw new InvalidBindingError("Container module registration is closed.");
       }
     };
@@ -257,15 +276,12 @@ export class Container {
       assertRegistering();
       return new BindingBuilder<T>(id, (binding) => {
         assertRegistering();
-        registered.push(binding);
-        this._addBinding(binding);
-      }, (previous, next) => {
-        const index = registered.indexOf(previous);
-        if (index !== -1 && this._moduleBindings.get(module) === registered) {
-          registered[index] = next;
-          this._replaceBinding(previous, next);
-        }
-      });
+        const entry: RegisteredBinding = binding;
+        entry.moduleBindings = registered;
+        entry.moduleIndex = registered.length;
+        registered.push(entry);
+        this._addBinding(entry);
+      }, (previous, next) => this._replaceBinding(previous, next));
     };
 
     try {
@@ -276,7 +292,7 @@ export class Container {
         throw new InvalidBindingError("Container module registries must be synchronous.");
       }
     } catch (err) {
-      if (this._moduleBindings.get(module) === registered) this.unload(module);
+      if (loaded.get(module) === registered) this.unload(module);
       throw err;
     } finally {
       open = false;
@@ -287,13 +303,17 @@ export class Container {
    * Unload a previously loaded `ContainerModule`, removing its bindings.
    */
   unload(module: ContainerModule): void {
-    const bindings = this._moduleBindings.get(module);
-    if (bindings) {
-      for (const binding of bindings) {
-        this._removeBinding(binding);
-      }
-      this._moduleBindings.delete(module);
+    const loaded = this._moduleBindings;
+    if (!loaded) return;
+    const bindings = loaded.get(module);
+    if (!bindings) return;
+    for (const binding of bindings) {
+      this._removeBinding(binding);
+      binding.moduleBindings = undefined;
     }
+    bindings.length = 0;
+    loaded.delete(module);
+    if (loaded.size === 0) this._moduleBindings = undefined;
   }
 
   /**
@@ -308,7 +328,7 @@ export class Container {
   get<T>(id: ServiceIdentifier<T>): T {
     const warm = this._warmSingleton(id);
     if (warm) return warm.cache as T;
-    return this._runSync(() => this._resolve(id, {}));
+    return this._runSync(() => this._resolve(id, unconstrained));
   }
 
   /**
@@ -330,7 +350,7 @@ export class Container {
    * Returns an array of resolved instances.
    */
   getAll<T>(id: ServiceIdentifier<T>): T[] {
-    return this._runSync(() => this._resolveAll(id, {}));
+    return this._runSync(() => this._resolveAll(id, unconstrained));
   }
 
   /**
@@ -338,7 +358,9 @@ export class Container {
    * Also works with sync bindings (returns an immediately-resolved promise).
    */
   async getAsync<T>(id: ServiceIdentifier<T>): Promise<Awaited<T>> {
-    const result = await this._runAsync(() => this._resolveAsync(id, {}));
+    const warm = this._warmSingleton(id);
+    if (warm) return await (warm.cache as T);
+    const result = await this._runAsync(() => this._resolveAsync(id, unconstrained));
     return await result.value;
   }
 
@@ -367,7 +389,7 @@ export class Container {
    * Returns an array of resolved instances.
    */
   async getAllAsync<T>(id: ServiceIdentifier<T>): Promise<T[]> {
-    return this._runAsync(() => this._resolveAllAsync(id, {}));
+    return this._runAsync(() => this._resolveAllAsync(id, unconstrained));
   }
 
   private _addBinding(binding: Binding): void {
@@ -379,19 +401,30 @@ export class Container {
     }
   }
 
-  private _replaceBinding(previous: Binding, next: Binding): void {
+  private _replaceBinding(previous: RegisteredBinding, next: RegisteredBinding): void {
     const list = this._bindings.get(previous.id);
     if (!list) return;
     const index = list.indexOf(previous);
-    if (index !== -1) list[index] = next;
+    if (index === -1) return;
+    list[index] = next;
+    const registered = previous.moduleBindings;
+    if (registered) {
+      next.moduleIndex = previous.moduleIndex;
+      next.moduleBindings = registered;
+      registered[next.moduleIndex!] = next;
+      previous.moduleBindings = undefined;
+    }
   }
 
   private _removeBinding(binding: Binding): void {
     const list = this._bindings.get(binding.id);
     if (!list) return;
+    if (list.length === 1) {
+      if (list[0] === binding) this._bindings.delete(binding.id);
+      return;
+    }
     const idx = list.indexOf(binding);
     if (idx !== -1) list.splice(idx, 1);
-    if (list.length === 0) this._bindings.delete(binding.id);
   }
 
   private _lookupAll(id: ServiceIdentifier): Binding[] {
@@ -487,7 +520,7 @@ export class Container {
 
   /** Singletons are built by the container that registered them, so a child cannot publish its own instance into the shared binding. */
   private _isForeignSingleton(binding: Binding): boolean {
-    return binding.scope === Scope.Singleton && !this._owns(binding);
+    return this._parent !== undefined && binding.scope === Scope.Singleton && !this._owns(binding);
   }
 
   /** Delegate lookup to the owner, retaining its request cache for this graph. */
@@ -497,7 +530,7 @@ export class Container {
     const contexts = parentStore.ctx.ownerContexts ??= new Map();
     let ctx = findStore(owner, parentStore)?.ctx ?? owner._syncCtx ?? contexts.get(owner);
     if (!ctx) {
-      ctx = { requestCache: new Map(), ownerContexts: contexts };
+      ctx = { ownerContexts: contexts };
       contexts.set(owner, ctx);
     }
     const store = { container: owner, ctx, frame: parentStore.frame, parentStore };
@@ -506,7 +539,7 @@ export class Container {
 
   private _runSync<T>(fn: () => T): T {
     if (findStore(this, resolutionStorage.getStore()) || this._syncCtx) return fn();
-    this._syncCtx = { requestCache: new Map() };
+    this._syncCtx = {};
     this._syncFrame = undefined;
     try {
       return fn();
@@ -528,7 +561,7 @@ export class Container {
       };
       return resolutionStorage.run(store, fn);
     }
-    const ctx: ResolutionContext = { requestCache: new Map() };
+    const ctx: ResolutionContext = {};
     const store: Store = { container: this, ctx, frame: parentStore?.frame, parentStore };
     return resolutionStorage.run(store, fn);
   }
@@ -550,11 +583,13 @@ export class Container {
   }
 
   private _captureStore(): Store {
+    const current = resolutionStorage.getStore();
+    if (current?.container === this) return current;
     return {
       container: this,
       ctx: this._currentCtx(),
       frame: this._currentFrame(),
-      parentStore: resolutionStorage.getStore(),
+      parentStore: current,
     };
   }
 
@@ -662,10 +697,8 @@ export class Container {
     if (binding.scope === Scope.Singleton && binding.pendingPromise) {
       throw new AsyncBindingError(id);
     }
-    const ctx = this._currentCtx();
-
     const requestEntry =
-      binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
+      binding.scope === Scope.Request ? this._currentCtx().requestCache?.get(binding) : undefined;
     if (requestEntry) {
       if (!requestEntry.settled) throw new AsyncBindingError(id);
       return requestEntry.value as T;
@@ -679,7 +712,8 @@ export class Container {
           binding.cache = instance;
           binding.cached = true;
         } else if (binding.scope === Scope.Request) {
-          ctx.requestCache.set(binding, { settled: true, value: instance });
+          const cache = this._currentCtx().requestCache ??= new Map();
+          cache.set(binding, { settled: true, value: instance });
         }
         return instance;
       });
@@ -714,7 +748,7 @@ export class Container {
     }
 
     const requestEntry =
-      binding.scope === Scope.Request ? ctx.requestCache.get(binding) : undefined;
+      binding.scope === Scope.Request ? ctx.requestCache?.get(binding) : undefined;
     if (requestEntry) {
       if (requestEntry.settled) return Promise.resolve({ value: requestEntry.value as T });
       return waitFor(caller, requestEntry.frame!, requestEntry.promise as Promise<Resolved<T>>);
@@ -796,14 +830,15 @@ export class Container {
       fail = reject;
     });
     pending.catch(() => {});
-    ctx.requestCache.set(binding, { settled: false, promise: pending, frame });
+    const cache = ctx.requestCache ??= new Map();
+    cache.set(binding, { settled: false, promise: pending, frame });
     try {
       const result = await this._produceAsync(binding);
-      ctx.requestCache.set(binding, { settled: true, value: result.value });
+      cache.set(binding, { settled: true, value: result.value });
       settle(result);
       return result;
     } catch (err) {
-      ctx.requestCache.delete(binding);
+      cache.delete(binding);
       fail(err);
       throw err;
     }
@@ -829,17 +864,19 @@ export class Container {
       throw new NotInjectableError(ctor);
     }
 
-    const ctorArgs = (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
-    const args = ctorArgs.map((arg) => {
-      const desc = normalizeArg(arg);
-      if (desc.multi) {
-        return this._resolveAll(desc.token, { named: desc.named, tags: desc.tags });
-      }
-      return this._resolve(desc.token, { named: desc.named, tags: desc.tags });
-    });
-
-    const instance = new ctor(...args);
-    this._injectProperties(instance as object, ctor, metadata);
+    const ctorArgs = metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata | undefined;
+    let instance: T;
+    if (ctorArgs?.length) {
+      const args = ctorArgs.map(arg => {
+        if (!isDescriptor(arg)) return this._resolve(arg, unconstrained);
+        const { multi, token, named, tags } = arg;
+        return multi ? this._resolveAll(token, { named, tags }) : this._resolve(token, { named, tags });
+      });
+      instance = new ctor(...args);
+    } else {
+      instance = new ctor();
+    }
+    if (hasInjectedProperties(metadata)) this._injectProperties(instance as object, ctor, metadata);
     return instance;
   }
 
@@ -850,22 +887,26 @@ export class Container {
       throw new NotInjectableError(ctor);
     }
 
-    const ctorArgs = (metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata) ?? [];
-    const caller = this._currentFrame();
-    const dependencies = await Promise.all(
-      ctorArgs.map(async (arg) => {
-        const desc = normalizeArg(arg);
-        if (desc.multi) {
-          const value = await this._resolveAllAsync(desc.token, { named: desc.named, tags: desc.tags }, caller);
-          return { value };
-        }
-        return this._resolveAsync(desc.token, { named: desc.named, tags: desc.tags }, caller);
-      }),
-    );
-
-    const args = dependencies.map(result => result.value);
-    const instance = resolutionStorage.run(store, () => new ctor(...args));
-    await resolutionStorage.run(store, () => this._injectPropertiesAsync(instance as object, ctor, metadata));
+    const ctorArgs = metadata[CONSTRUCTOR_INJECT_KEY] as ConstructorInjectMetadata | undefined;
+    let instance: T;
+    if (ctorArgs?.length) {
+      const caller = store.frame;
+      const dependencies = await Promise.all(ctorArgs.map(async arg => {
+        if (!isDescriptor(arg)) return this._resolveAsync(arg, unconstrained, caller);
+        const { multi, token, named, tags } = arg;
+        if (multi) return { value: await this._resolveAllAsync(token, { named, tags }, caller) };
+        return this._resolveAsync(token, { named, tags }, caller);
+      }));
+      const args = dependencies.map(result => result.value);
+      instance = resolutionStorage.run(store, () => new ctor(...args));
+    } else {
+      // Keep getAsync construction deferred, including in runtimes without native async context.
+      await Promise.resolve();
+      instance = resolutionStorage.run(store, () => new ctor());
+    }
+    if (hasInjectedProperties(metadata)) {
+      await this._injectPropertiesAsync(instance as object, ctor, metadata, store);
+    }
     return { value: instance };
   }
 
@@ -875,26 +916,26 @@ export class Container {
     metadata: Record<symbol, unknown>,
   ): void {
     const propMap =
-      (metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata) ?? new Map();
+      metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata | undefined;
     const namedMap =
-      (metadata[NAMED_INJECT_KEY] as NamedInjectMetadata) ?? new Map();
+      metadata[NAMED_INJECT_KEY] as NamedInjectMetadata | undefined;
     const taggedMap =
-      (metadata[TAGGED_INJECT_KEY] as TaggedInjectMetadata) ?? new Map();
+      metadata[TAGGED_INJECT_KEY] as TaggedInjectMetadata | undefined;
     const multiMap =
-      (metadata[MULTI_INJECT_KEY] as MultiInjectMetadata) ?? new Map();
+      metadata[MULTI_INJECT_KEY] as MultiInjectMetadata | undefined;
 
-    for (const [fieldName, token] of propMap) {
+    for (const [fieldName, token] of propMap ?? []) {
       const value = this._resolve(token, {
-        named: namedMap.get(fieldName),
-        tags: taggedMap.get(fieldName),
+        named: namedMap?.get(fieldName),
+        tags: taggedMap?.get(fieldName),
       });
       this._assign(instance, ctor, metadata, fieldName, value);
     }
 
-    for (const [fieldName, token] of multiMap) {
+    for (const [fieldName, token] of multiMap ?? []) {
       const value = this._resolveAll(token, {
-        named: namedMap.get(fieldName),
-        tags: taggedMap.get(fieldName),
+        named: namedMap?.get(fieldName),
+        tags: taggedMap?.get(fieldName),
       });
       this._assign(instance, ctor, metadata, fieldName, value);
     }
@@ -904,29 +945,29 @@ export class Container {
     instance: object,
     ctor: Constructor,
     metadata: Record<symbol, unknown>,
+    store: Store,
   ): Promise<void> {
-    const store = this._captureStore();
     const propMap =
-      (metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata) ?? new Map();
+      metadata[PROPERTY_INJECT_KEY] as PropertyInjectMetadata | undefined;
     const namedMap =
-      (metadata[NAMED_INJECT_KEY] as NamedInjectMetadata) ?? new Map();
+      metadata[NAMED_INJECT_KEY] as NamedInjectMetadata | undefined;
     const taggedMap =
-      (metadata[TAGGED_INJECT_KEY] as TaggedInjectMetadata) ?? new Map();
+      metadata[TAGGED_INJECT_KEY] as TaggedInjectMetadata | undefined;
     const multiMap =
-      (metadata[MULTI_INJECT_KEY] as MultiInjectMetadata) ?? new Map();
+      metadata[MULTI_INJECT_KEY] as MultiInjectMetadata | undefined;
 
-    for (const [fieldName, token] of propMap) {
+    for (const [fieldName, token] of propMap ?? []) {
       const { value } = await resolutionStorage.run(store, () => this._resolveAsync(token, {
-        named: namedMap.get(fieldName),
-        tags: taggedMap.get(fieldName),
+        named: namedMap?.get(fieldName),
+        tags: taggedMap?.get(fieldName),
       }));
       resolutionStorage.run(store, () => this._assign(instance, ctor, metadata, fieldName, value));
     }
 
-    for (const [fieldName, token] of multiMap) {
+    for (const [fieldName, token] of multiMap ?? []) {
       const values = await resolutionStorage.run(store, () => this._resolveAllAsync(token, {
-        named: namedMap.get(fieldName),
-        tags: taggedMap.get(fieldName),
+        named: namedMap?.get(fieldName),
+        tags: taggedMap?.get(fieldName),
       }));
       resolutionStorage.run(store, () => this._assign(instance, ctor, metadata, fieldName, values));
     }

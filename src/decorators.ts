@@ -109,17 +109,10 @@ export function injectable(options?: InjectableOptions) {
         | undefined;
       // Default constructors, including compiler-generated forwarding
       // constructors for decorated fields, reuse the base argument list.
-      if (inherited && inherited.length > 0 && !hasNonForwardingConstructor(ctor)) {
-        context.metadata[CONSTRUCTOR_INJECT_KEY] = [...inherited];
-      } else {
-        context.metadata[CONSTRUCTOR_INJECT_KEY] = [];
+      if (inherited?.length) {
+        context.metadata[CONSTRUCTOR_INJECT_KEY] = hasNonForwardingConstructor(ctor) ? [] : [...inherited];
       }
     }
-    getOwnMap(context.metadata, PROPERTY_INJECT_KEY);
-    getOwnMap(context.metadata, NAMED_INJECT_KEY);
-    getOwnMap(context.metadata, TAGGED_INJECT_KEY);
-    getOwnMap(context.metadata, MULTI_INJECT_KEY);
-    getOwnMap(context.metadata, ACCESSOR_INJECT_KEY);
   };
 }
 
@@ -187,7 +180,9 @@ export function inject(token: ServiceIdentifier) {
       context.metadata,
       PROPERTY_INJECT_KEY,
     );
-    getOwnMap(context.metadata, MULTI_INJECT_KEY).delete(key);
+    if (context.metadata[MULTI_INJECT_KEY]) {
+      getOwnMap(context.metadata, MULTI_INJECT_KEY).delete(key);
+    }
     propMap.set(key, token);
   };
 }
@@ -285,7 +280,9 @@ export function multiInject(token: ServiceIdentifier) {
       context.metadata,
       MULTI_INJECT_KEY,
     );
-    getOwnMap(context.metadata, PROPERTY_INJECT_KEY).delete(key);
+    if (context.metadata[PROPERTY_INJECT_KEY]) {
+      getOwnMap(context.metadata, PROPERTY_INJECT_KEY).delete(key);
+    }
     multiMap.set(key, token);
   };
 }

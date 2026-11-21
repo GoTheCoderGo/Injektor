@@ -206,6 +206,31 @@ describe("module registration", () => {
     expect(c.isBound("late")).toBe(false);
   });
 
+  it("unloads only live module bindings after unbind and rebind", () => {
+    const c = new Container();
+    let stale!: BindingBuilder<number>;
+    let live!: BindingBuilder<string>;
+    const a = new ContainerModule(bind => {
+      stale = bind<number>("replace").toConstant(1);
+      live = bind<string>("shared").toConstant("a");
+    });
+    const b = new ContainerModule(bind => {
+      bind("replace").toConstant(2);
+      bind("shared").toConstant("b");
+    });
+    c.load(a);
+    c.load(b);
+    c.rebind("replace").toConstant(3);
+    stale.toConstant(4);
+    live.toConstant("updated");
+    expect(c.getAll("shared")).toEqual(["updated", "b"]);
+    c.unload(a);
+    expect(c.getAll("shared")).toEqual(["b"]);
+    c.unload(b);
+    expect(c.isBound("shared")).toBe(false);
+    expect(c.getAll("replace")).toEqual([3]);
+  });
+
   it("tracks retargeted bindings and prevents late registration after unload", () => {
     const c = new Container();
     let register!: BindFunction;
