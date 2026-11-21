@@ -69,7 +69,7 @@ export interface Binding<T = unknown> {
   cache?: T;
   /** True after a singleton value has been stored. */
   cached?: boolean;
-  /** In-flight promise for async singleton resolution. */
+  /** @deprecated The container tracks pending singleton initialization internally. */
   pendingPromise?: Promise<T>;
   /** Named constraint for this binding. */
   name?: string;

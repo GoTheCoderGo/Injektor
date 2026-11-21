@@ -16,6 +16,7 @@ cd "$work"
 "$compiler" --version
 "$compiler" --strict --target es2022 --lib es2022,decorators --module node16 --outDir out consumer.mts plugin.cts browser.mts
 node --unhandled-rejections=strict out/consumer.mjs
+node --unhandled-rejections=strict --input-type=module -e 'process.getBuiltinModule = undefined; await import("./out/consumer.mjs")'
 bun out/consumer.mjs
-bun build browser.mts --target browser --outfile browser.mjs
+bun build out/browser.mjs --target browser --outfile browser.mjs
 node --input-type=module -e 'globalThis.process = undefined; await import("./browser.mjs")'

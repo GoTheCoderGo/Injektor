@@ -35,6 +35,10 @@ function getOwnMap<K, V>(metadata: Record<symbol, any>, key: symbol): Map<K, V> 
 
 const accessorKeys = new WeakMap<object, Map<string, Map<string | symbol, symbol>>>();
 
+// Qualifiers declared on an override may run before or after its injection decorator.
+type Qualifiers = { named?: string; tags?: Record<string, unknown> };
+const overrideQualifiers = new WeakMap<AccessorInjectInfo, Qualifiers>();
+
 /** Remember the setter under an identity shared by decorators on this accessor. */
 function recordAccessor(context: ClassAccessorDecoratorContext): string | symbol {
   // Public instance accessors retain name-based overriding. Private accessors
@@ -54,6 +58,9 @@ function recordAccessor(context: ClassAccessorDecoratorContext): string | symbol
     context.metadata,
     ACCESSOR_INJECT_KEY,
   );
+  const previous = map.get(key);
+  const inherited = Object.getPrototypeOf(context.metadata)?.[ACCESSOR_INJECT_KEY]?.get(key);
+  if (previous && previous !== inherited) return key;
   const info: AccessorInjectInfo = {
     set: context.access.set,
     static: context.static,
@@ -63,8 +70,27 @@ function recordAccessor(context: ClassAccessorDecoratorContext): string | symbol
       info.home = this as Function;
     });
   }
+  if (inherited) overrideQualifiers.set(info, {});
   map.set(key, info);
   return key;
+}
+
+function ownQualifiers(metadata: Record<symbol, any>, key: string | symbol): Qualifiers | undefined {
+  return overrideQualifiers.get(metadata[ACCESSOR_INJECT_KEY].get(key));
+}
+
+/** A new injection declaration starts with the qualifiers on this accessor. */
+function replaceInheritedQualifiers(metadata: Record<symbol, any>, key: string | symbol): void {
+  const own = ownQualifiers(metadata, key);
+  if (!own) return;
+  if (metadata[NAMED_INJECT_KEY] && own.named === undefined) {
+    getOwnMap(metadata, NAMED_INJECT_KEY).delete(key);
+  }
+  if (metadata[TAGGED_INJECT_KEY]) {
+    const tags = getOwnMap(metadata, TAGGED_INJECT_KEY);
+    if (own.tags) tags.set(key, own.tags);
+    else tags.delete(key);
+  }
 }
 
 /**
@@ -110,7 +136,7 @@ export function injectable(options?: InjectableOptions) {
       // Default constructors, including compiler-generated forwarding
       // constructors for decorated fields, reuse the base argument list.
       if (inherited?.length) {
-        context.metadata[CONSTRUCTOR_INJECT_KEY] = hasNonForwardingConstructor(ctor) ? [] : [...inherited];
+        context.metadata[CONSTRUCTOR_INJECT_KEY] = inheritsConstructorArguments(ctor) ? [...inherited] : [];
       }
     }
   };
@@ -176,6 +202,7 @@ export function inject(token: ServiceIdentifier) {
     }
 
     const key = recordAccessor(context);
+    replaceInheritedQualifiers(context.metadata, key);
     const propMap = getOwnMap<string | symbol, ServiceIdentifier>(
       context.metadata,
       PROPERTY_INJECT_KEY,
@@ -215,6 +242,8 @@ export function named(name: string) {
       context.metadata,
       NAMED_INJECT_KEY,
     );
+    const own = ownQualifiers(context.metadata, key);
+    if (own) own.named = name;
     namedMap.set(key, name);
   };
 }
@@ -248,6 +277,8 @@ export function tagged(key: string, value: unknown) {
       context.metadata,
       TAGGED_INJECT_KEY,
     );
+    const own = ownQualifiers(context.metadata, identity);
+    if (own) own.tags = { ...own.tags, [key]: value };
     const existing = taggedMap.get(identity);
     taggedMap.set(identity, { ...existing, [key]: value });
   };
@@ -276,6 +307,7 @@ export function multiInject(token: ServiceIdentifier) {
     }
 
     const key = recordAccessor(context);
+    replaceInheritedQualifiers(context.metadata, key);
     const multiMap = getOwnMap<string | symbol, ServiceIdentifier>(
       context.metadata,
       MULTI_INJECT_KEY,
@@ -285,6 +317,16 @@ export function multiInject(token: ServiceIdentifier) {
     }
     multiMap.set(key, token);
   };
+}
+
+function inheritsConstructorArguments(ctor: Function): boolean {
+  for (let current = ctor; typeof current === "function"; current = Object.getPrototypeOf(current)) {
+    if (hasNonForwardingConstructor(current)) return false;
+    const base = Object.getPrototypeOf(current);
+    if (base && Object.hasOwn(base, Symbol.metadata) &&
+        Object.hasOwn(base[Symbol.metadata], CONSTRUCTOR_INJECT_KEY)) return true;
+  }
+  return false;
 }
 
 function hasNonForwardingConstructor(ctor: Function): boolean {
@@ -305,8 +347,19 @@ function hasNonForwardingConstructor(ctor: Function): boolean {
         const params = body.slice(open + 1, close).trim();
         const rest = params.match(/^\.\.\.\s*([\w$]+)$/)?.[1];
         const forwarded = params === "" ? "arguments" : rest;
-        const start = body.slice(close + 1).match(/^\s*\{\s*super\s*\(\s*\.\.\.\s*([\w$]+)\s*\)/);
-        return !forwarded || start?.[1] !== forwarded;
+        if (!forwarded) return true;
+        const start = body.indexOf("{", close + 1);
+        const end = closingDelimiter(body, start, "{", "}");
+        const statements = body.slice(start + 1, end);
+        const nested = classBodyRanges(statements);
+        let forwards = false;
+        for (const call of statements.matchAll(/(?<![\w$.])super\s*\(/g)) {
+          if (nested.some(range => range.start <= call.index && call.index < range.end)) continue;
+          const args = statements.slice(call.index + call[0].length);
+          if (args.match(/^\s*\.\.\.\s*([\w$]+)\s*\)/)?.[1] !== forwarded) return true;
+          forwards = true;
+        }
+        return !forwards;
       }
     }
     if (ch === "{") brace++;

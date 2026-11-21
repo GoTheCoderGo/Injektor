@@ -1,5 +1,5 @@
 // Import the library only after hiding native storage, in a dedicated process.
-(process as unknown as { getBuiltinModule?: unknown }).getBuiltinModule = undefined;
+Object.defineProperty(globalThis, "process", { value: undefined, configurable: true });
 const {
   Container, injectable, injectConstructor, inject, multiInject, named,
   createToken, CircularDependencyError,
@@ -68,7 +68,9 @@ catch (err) { directCycle = err instanceof CircularDependencyError; }
 
 const left = createToken<object>("left");
 const right = createToken<object>("right");
-c.bind(left).toAsyncFactory(async (ctx) => { await Promise.resolve(); return ctx.getAsync(right); }).inSingletonScope();
+const provideRight = createToken<() => Promise<object>>("provide right");
+c.bind(provideRight).toFactory(ctx => () => ctx.getAsync(right));
+c.bind(left).toAsyncFactory(async (ctx) => { await Promise.resolve(); return ctx.get(provideRight)(); }).inSingletonScope();
 c.bind(right).toAsyncFactory(async (ctx) => { await Promise.resolve(); return ctx.getAsync(left); }).inSingletonScope();
 @injectable()
 @injectConstructor(left, right)

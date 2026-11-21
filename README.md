@@ -60,6 +60,10 @@ export class ChainMail implements IArmor {
 }
 ```
 
+When passing tokens to registration helpers, keep the type inferred by
+`createToken<T>()`, or use `BindingIdentifier<T>` for the parameter. Use
+`ServiceIdentifier<T>` for helpers that only look up services.
+
 ### 2. Inject dependencies
 
 You can inject via the **constructor** or via **properties** (auto-accessors).
@@ -113,6 +117,11 @@ container.bind(ARMOR).to(ChainMail).inTransientScope();
 container.bind(Warrior).toSelf().inRequestScope();
 ```
 
+When a child container resolves an inherited singleton or request-scoped binding,
+its dependencies come from the container that registered it. A child and a parent
+singleton can therefore share the same request-scoped binding within one graph.
+Inherited transient bindings resolve their dependencies through the requesting container.
+
 You can also define the default scope directly in the `@injectable` decorator:
 
 ```typescript
@@ -149,7 +158,10 @@ const service = await container.getAsync(SERVICE);
 Existing factories that take no arguments continue to work. In browsers, use
 `ctx` for dependency lookups after `await`: calling the outer container at that
 point starts a separate resolution graph. Runtimes with native async context
-also preserve the graph for calls through the outer container.
+also preserve the graph for calls through the outer container while the factory
+is running, including while its returned native promise is pending. After it
+settles, timers and other detached callbacks start fresh graphs when they use
+the outer container. An explicitly captured `ctx` keeps access to its graph.
 
 While a singleton is being initialized asynchronously, synchronous `get()`
 throws `AsyncBindingError`. Await `getAsync()` to share its pending result;
@@ -157,7 +169,10 @@ subsequent synchronous lookups return the cached instance.
 
 If a synchronous factory returns a promise as the service value, `get()`
 and dependency injection preserve that promise. Awaiting `getAsync()`
-returns its fulfillment value.
+returns its fulfillment value. On Node and Bun the container observes native
+promise settlement to release the factory context. A discarded promise-valued
+service can therefore count as handled for runtime rejection reporting. Awaiting
+the promise still propagates its rejection.
 
 `ContainerModule` registries run synchronously during `load()`. Register
 an async factory inside the registry for services that need asynchronous setup.

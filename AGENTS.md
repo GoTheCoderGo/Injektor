@@ -36,7 +36,7 @@ For performance changes, run `bun benchmarks/container.bench.ts` or `bun benchma
 
 ## Resolution invariants
 
-- Single lookups try matching local bindings before ancestors and fall back to autobinding when eligible. Multi-lookups combine local and ancestor bindings in that order. Ancestor singletons resolve dependencies through their owning container.
+- Single lookups try matching local bindings before ancestors and fall back to autobinding when eligible. Multi-lookups combine local and ancestor bindings in that order. Ancestor singleton and request-scoped bindings resolve dependencies through their owning container. Inherited transients use the requesting container.
 - Request scope shares values inside one resolution graph and isolates separate top-level lookups. Factories use their captured `ResolutionContext` for lookups after `await` in browsers. Keep Node built-ins out of static imports in runtime source so the browser fallback can load.
 - Track caching and cycles by binding identity. Pending async singleton and request resolutions can be shared by concurrent callers, and failures clear the pending entry for retry. A synchronous lookup throws `AsyncBindingError` if it would need to wait for pending initialization. A cached `undefined` is a cache hit.
 - Preserve promise-valued services from synchronous factories in sync lookups, injection, and async multi-lookups. Public single async lookups await their result. Async cycle detection covers both recursive lookups and waits between parallel branches.

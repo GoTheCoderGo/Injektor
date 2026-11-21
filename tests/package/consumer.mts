@@ -1,6 +1,6 @@
 import {
-  Container, CircularDependencyError, ServiceNotFoundError,
-  createToken, injectable, injectConstructor,
+  BindingBuilder, Container, CircularDependencyError, ServiceNotFoundError,
+  createToken, injectable, injectConstructor, type ServiceIdentifier,
 } from "@ilya_coder/injektor";
 import plugin = require("./plugin.cjs");
 
@@ -15,6 +15,15 @@ function checkTokenTypes(c: Container) {
   c.bind<string>(text).toConstant("value");
   c.bind<number>(Symbol("raw")).toConstant(42);
   c.get(text).toUpperCase();
+  const lookup: ServiceIdentifier<string> = text;
+  c.get(lookup).toUpperCase();
+  // @ts-expect-error a lookup-only identifier cannot authorize a widened registration
+  c.bind<string | number>(lookup).toConstant(42);
+  const emptyLookup: ServiceIdentifier<undefined> = createToken<undefined>("empty");
+  // @ts-expect-error a lookup for undefined must not be accepted as a raw symbol
+  c.rebind<number>(emptyLookup);
+  // @ts-expect-error standalone builders also require a registration identifier
+  new BindingBuilder<string | number>(lookup, () => {});
   // @ts-expect-error a numeric binding cannot write to a string token
   c.bind<number>(text);
   // @ts-expect-error widening the registration type would permit writing a number
@@ -61,3 +70,13 @@ try {
 } catch (error) {
   if (!(error instanceof CircularDependencyError)) throw error;
 }
+
+// Also exercised in a fresh Node process without process.getBuiltinModule.
+const request = createToken<object>("request");
+esmContainer.bind(request).toFactory(() => ({})).inRequestScope();
+esmContainer.bind("ambient").toAsyncFactory(async () => {
+  const first = esmContainer.get(request);
+  await Promise.resolve();
+  check(first === esmContainer.get(request), "native request context was lost");
+});
+await esmContainer.getAsync("ambient");

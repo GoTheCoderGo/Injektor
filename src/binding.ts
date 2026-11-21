@@ -1,4 +1,4 @@
-import type { Constructor, ServiceIdentifier, Binding, ResolutionContext } from "./types.ts";
+import type { Constructor, BindingIdentifier, Binding, ResolutionContext } from "./types.ts";
 import { Scope, BindingType } from "./types.ts";
 import { getInjectableMetadata, SCOPE_KEY } from "./consts.ts";
 import { InvalidBindingError } from "./errors.ts";
@@ -27,7 +27,7 @@ export class BindingBuilder<T> {
   private _scopeExplicit = false;
 
   constructor(
-    id: ServiceIdentifier<T>,
+    id: BindingIdentifier<T>,
     private readonly _onComplete: (binding: Binding<T>) => void,
     private readonly _onReplace?: (previous: Binding<T>, next: Binding<T>) => void,
   ) {
@@ -93,9 +93,7 @@ export class BindingBuilder<T> {
    * The same instance is reused for every resolution.
    */
   inSingletonScope(): this {
-    this._binding.scope = Scope.Singleton;
-    this._scopeExplicit = true;
-    return this;
+    return this._setScope(Scope.Singleton);
   }
 
   /**
@@ -103,9 +101,7 @@ export class BindingBuilder<T> {
    * A new instance is created for every resolution.
    */
   inTransientScope(): this {
-    this._binding.scope = Scope.Transient;
-    this._scopeExplicit = true;
-    return this;
+    return this._setScope(Scope.Transient);
   }
 
   /**
@@ -113,9 +109,7 @@ export class BindingBuilder<T> {
    * A single instance is shared within one `container.get()` call graph.
    */
   inRequestScope(): this {
-    this._binding.scope = Scope.Request;
-    this._scopeExplicit = true;
-    return this;
+    return this._setScope(Scope.Request);
   }
 
   // ─────────────────────── Constraint methods ───────────────────
@@ -140,6 +134,16 @@ export class BindingBuilder<T> {
   }
 
   // ─────────────────────── Internal ─────────────────────────────
+
+  private _setScope(scope: Scope): this {
+    this._scopeExplicit = true;
+    if (this._committed && this._binding.scope !== scope) {
+      const { type, implementationClass, value, factory, asyncFactory } = this._binding;
+      return this._setTarget({ type, implementationClass, value, factory, asyncFactory }, scope);
+    }
+    this._binding.scope = scope;
+    return this;
+  }
 
   /** Publish a complete target. Old resolutions keep their original binding and cache. */
   private _setTarget(target: BindingTarget<T>, scope = this._binding.scope): this {

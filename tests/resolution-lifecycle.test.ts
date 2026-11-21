@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   AsyncBindingError, Container, ContainerModule, InvalidBindingError,
   NotInjectableError, Scope, ServiceNotFoundError, createToken, inject,
-  injectConstructor, injectable, multiInject,
+  injectConstructor, injectable, multiInject, named, tagged,
 } from "../index.ts";
 import type { BindFunction, BindingBuilder } from "../index.ts";
 
@@ -67,6 +67,56 @@ describe("inherited injection metadata", () => {
     c.bind("previousSingle").toConstant(["old"]);
     const base = c.get(Base);
     expect([base.first, base.second]).toEqual([["old"], ["old"]]);
+  });
+
+  it("replaces inherited qualifiers and keeps the qualifiers on the override in either order", async () => {
+    @injectable()
+    class Base {
+      @inject("base") @named("old") @tagged("obsolete", true) accessor plain!: string;
+      @multiInject("base") @named("old") @tagged("obsolete", true) accessor many!: string[];
+    }
+    @injectable()
+    class Child extends Base {
+      @inject("plain") override accessor plain = "";
+      @named("new") @multiInject("group") @tagged("keep", true) override accessor many: string[] = [];
+    }
+    const c = new Container({ autoBindInjectable: true });
+    c.bind("plain").toConstant("plain");
+    c.bind("group").toConstant("ok").whenNamed("new").whenTagged("keep", true);
+    c.bind("group").toConstant("wrong").whenNamed("new");
+    c.bind("group").toConstant("other name").whenTagged("keep", true);
+    c.bind("base").toConstant("original").whenNamed("old").whenTagged("obsolete", true);
+    c.bind("base").toConstant("unqualified");
+    for (const child of [c.get(Child), await c.getAsync(Child)]) {
+      expect(child.plain).toBe("plain");
+      expect(child.many).toEqual(["ok"]);
+    }
+    expect(c.get(Base).plain).toBe("original");
+    expect(c.get(Base).many).toEqual(["original"]);
+  });
+
+  it("inherits constructor tokens only through a chain of forwarding constructors", async () => {
+    @injectable()
+    @injectConstructor("dep")
+    class Base { constructor(readonly value: string) {} }
+    class SuppliesValue extends Base { constructor() { super("local"); } }
+    @injectable()
+    class Leaf extends SuppliesValue {}
+
+    let traced = 0;
+    class Forwarder extends Base {
+      constructor(...args: ConstructorParameters<typeof Base>) { traced++; super(...args); }
+    }
+    @injectable()
+    class TracedLeaf extends Forwarder {}
+
+    const c = new Container({ autoBindInjectable: true });
+    expect(c.get(Leaf).value).toBe("local");
+    expect((await c.getAsync(Leaf)).value).toBe("local");
+    c.bind("dep").toConstant("injected");
+    expect(c.get(TracedLeaf).value).toBe("injected");
+    expect((await c.getAsync(TracedLeaf)).value).toBe("injected");
+    expect(traced).toBe(2);
   });
 
   it("requires an own injectable marker even with other Stage 3 metadata", async () => {

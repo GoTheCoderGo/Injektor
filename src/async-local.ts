@@ -9,27 +9,63 @@ export interface AsyncLocalStorageLike<T> {
   run<R>(store: T, callback: () => R): R;
 }
 
-type BuiltinModule = {
-  getBuiltinModule?: (id: string) => { AsyncLocalStorage?: new () => AsyncLocalStorageLike<unknown> };
+type Slot<T> = { store?: T };
+
+type NativeModule = {
+  AsyncLocalStorage?: new <T>() => AsyncLocalStorageLike<T>;
+  types?: { isPromise(value: unknown): boolean };
 };
 
-export function createAsyncLocalStorage<T>(): AsyncLocalStorageLike<T> {
-  const Native = loadNativeAsyncLocalStorage();
-  if (Native) return new Native();
+type BuiltinLoader = (id: string) => NativeModule | undefined;
+
+/** Keep a factory's ambient store alive until its native promise settles. */
+export function createFactoryStorage<T>(): AsyncLocalStorageLike<T> {
+  const proc = (globalThis as { process?: {
+    versions?: { node?: string };
+    getBuiltinModule?: BuiltinLoader;
+  } }).process;
+  // Older Node releases reach this code through the package's CommonJS runtime.
+  const nativeRequire = proc?.versions?.node && typeof require === "function" ? require : undefined;
+  const load: BuiltinLoader | undefined = typeof proc?.getBuiltinModule === "function"
+    ? proc.getBuiltinModule.bind(proc)
+    : nativeRequire;
+  if (load) {
+    try {
+      const Native = load("node:async_hooks")?.AsyncLocalStorage;
+      const isPromise = load("node:util")?.types?.isPromise;
+      if (Native && isPromise) return new NativeFactoryStorage(new Native<Slot<T>>(), isPromise);
+    } catch {
+      // A browser process shim may expose a loader without Node built-ins.
+    }
+  }
   return new SynchronousLocalStorage<T>();
 }
 
-function loadNativeAsyncLocalStorage(): (new <T>() => AsyncLocalStorageLike<T>) | undefined {
-  const proc = (globalThis as { process?: BuiltinModule }).process;
-  if (typeof proc?.getBuiltinModule !== "function") return undefined;
-  try {
-    const hooks = proc.getBuiltinModule("node:" + "async_hooks");
-    const Ctor = hooks?.AsyncLocalStorage;
-    if (typeof Ctor === "function") return Ctor as new <T>() => AsyncLocalStorageLike<T>;
-  } catch {
-    return undefined;
+class NativeFactoryStorage<T> implements AsyncLocalStorageLike<T> {
+  constructor(
+    private readonly storage: AsyncLocalStorageLike<Slot<T>>,
+    private readonly isPromise: (value: unknown) => boolean,
+  ) {}
+
+  getStore(): T | undefined {
+    return this.storage.getStore()?.store;
   }
-  return undefined;
+
+  run<R>(store: T, callback: () => R): R {
+    // Clearing the slot releases the graph even if a timer keeps its async resource alive.
+    const slot: Slot<T> = { store };
+    const close = () => { slot.store = undefined; };
+    try {
+      const value = this.storage.run(slot, callback);
+      // Node's brand check recognizes promises across realms without consuming lazy thenables.
+      if (this.isPromise(value)) Promise.prototype.then.call(value, close, close);
+      else close();
+      return value;
+    } catch (error) {
+      close();
+      throw error;
+    }
+  }
 }
 
 /** Synchronous context fallback that never leaks a pending async call's store. */
